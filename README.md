@@ -147,6 +147,11 @@ optional commented `HF_TOKEN = os.environ["HF_TOKEN"]` line.
 | `03_finetune_sft_lora.ipynb` | Train completion-only Gemma 4 LoRA SFT | `artifacts/gemma4-scientific-design-sft/` |
 | `04_finetune_grpo_lora.ipynb` | Continue the SFT adapter with grouped Luna-judged GRPO | `artifacts/gemma4-scientific-design-grpo/` |
 
+Notebooks 03 and 04 are Hub-first: a fresh clone downloads the published datasets and
+the SFT adapter directly from the repositories below. You do not need to run notebooks 01–03
+before starting notebook 04. To use locally generated artifacts instead, change the explicit
+`*_SOURCE_MODE` variables from `"hub"` to `"local"` in the corresponding training notebook.
+
 ## Dataset structure
 
 The local canonical records retain:
@@ -212,6 +217,17 @@ Publication defaults:
 | `lamm-mit/scientific-sft-grpo-data` / `scientific_design_grpo` | Public GRPO train, validation, and test splits |
 | `lamm-mit/scientific-sft-grpo-design-sft` | Final SFT adapter and every saved checkpoint |
 | `lamm-mit/scientific-sft-grpo-design-grpo` | Final GRPO adapter and every saved checkpoint |
+
+The default training inputs are:
+
+- notebook 03: `lamm-mit/scientific-sft-grpo-data`, configuration
+  `scientific_design_sft`;
+- notebook 04: `lamm-mit/scientific-sft-grpo-data`, configuration
+  `scientific_design_grpo`, plus the
+  `lamm-mit/scientific-sft-grpo-design-sft` adapter.
+
+Hugging Face caches these downloads. Gemma itself remains gated, so accept Google's Gemma
+license and run `hf auth login` before training.
 
 Trainer publication uses `hub_strategy="all_checkpoints"` plus an explicit final push.
 

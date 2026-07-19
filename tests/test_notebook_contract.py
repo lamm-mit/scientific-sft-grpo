@@ -48,7 +48,13 @@ def test_training_notebooks_expose_models_training_and_hub_parameters():
         assert "HUB_STRATEGY =" in source
         assert 'HF_TOKEN = None' in source
     assert "LORA_RANK =" in sft
+    assert 'SFT_DATA_SOURCE_MODE = "hub"' in sft
+    assert "load_dataset(" in sft
     assert 'JUDGE_MODEL = DEFAULT_JUDGE_MODEL' in grpo
+    assert 'GRPO_DATA_SOURCE_MODE = "hub"' in grpo
+    assert 'SFT_ADAPTER_SOURCE_MODE = "hub"' in grpo
+    assert "load_dataset(" in grpo
+    assert "SFT_ADAPTER_SOURCE = (" in grpo
     assert "FORMAT_BASE_REWARD = 0.10" in grpo
     assert "SEMANTIC_REWARD_WEIGHT = 0.90" in grpo
     assert "NUM_GENERATIONS = 4" in grpo

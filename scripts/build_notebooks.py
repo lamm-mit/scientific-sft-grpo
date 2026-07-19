@@ -864,7 +864,7 @@ nb3 = notebook(
 
             import matplotlib.pyplot as plt
             import pandas as pd
-            from datasets import load_from_disk
+            from datasets import load_dataset, load_from_disk
             from IPython.display import JSON, Markdown, display
             from trl import SFTConfig, SFTTrainer
 
@@ -884,16 +884,18 @@ nb3 = notebook(
             if ROOT.name == "notebooks":
                 ROOT = ROOT.parent
 
-            # Runtime and local artifacts
+            # Runtime, input source, and local artifacts
             ENABLE_MPS_FALLBACK = True
             TOKENIZERS_PARALLELISM = False
             if ENABLE_MPS_FALLBACK:
                 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
             os.environ["TOKENIZERS_PARALLELISM"] = str(TOKENIZERS_PARALLELISM).lower()
             MODEL_ID = "google/gemma-4-E4B-it"
-            SFT_DATA = ROOT / "data" / "processed" / "scientific_design_sft"
+            SFT_DATA_SOURCE_MODE = "hub"  # "hub" or "local"
+            LOCAL_SFT_DATA = ROOT / "data" / "processed" / "scientific_design_sft"
             OUTPUT_DIR = ROOT / "artifacts" / "gemma4-scientific-design-sft"
             RESUME_FROM_CHECKPOINT = None
+            AUTO_RESUME_LATEST_CHECKPOINT = True
 
             # LoRA
             LORA_RANK = 16
@@ -908,7 +910,11 @@ nb3 = notebook(
             TRAIN_BATCH_SIZE = 1
             EVAL_BATCH_SIZE = 1
             GRADIENT_ACCUMULATION_STEPS = 8
-            MAX_SEQUENCE_LENGTH = 1_536
+            MAX_SEQUENCE_LENGTH = 1_024
+            MPS_PAD_TO_MULTIPLE_OF = 128
+            OTHER_PAD_TO_MULTIPLE_OF = 8
+            MPS_EMPTY_CACHE_STEPS = 5
+            OTHER_EMPTY_CACHE_STEPS = None
             COMPLETION_ONLY_LOSS = True
             LOSS_TYPE = "nll"
             GRADIENT_CHECKPOINTING = True
@@ -945,9 +951,28 @@ nb3 = notebook(
 
             versions = require_training_stack()
             runtime = detect_runtime()
+            if SFT_DATA_SOURCE_MODE not in {"hub", "local"}:
+                raise ValueError("SFT_DATA_SOURCE_MODE must be 'hub' or 'local'.")
             DATALOADER_PIN_MEMORY = (
                 runtime.backend == "cuda" if PIN_MEMORY_ON_CUDA_ONLY else True
             )
+            PAD_TO_MULTIPLE_OF = (
+                MPS_PAD_TO_MULTIPLE_OF
+                if runtime.backend == "mps"
+                else OTHER_PAD_TO_MULTIPLE_OF
+            )
+            TORCH_EMPTY_CACHE_STEPS = (
+                MPS_EMPTY_CACHE_STEPS
+                if runtime.backend == "mps"
+                else OTHER_EMPTY_CACHE_STEPS
+            )
+            if AUTO_RESUME_LATEST_CHECKPOINT and RESUME_FROM_CHECKPOINT is None:
+                checkpoints = sorted(
+                    OUTPUT_DIR.glob("checkpoint-*"),
+                    key=lambda path: int(path.name.rsplit("-", 1)[-1]),
+                )
+                if checkpoints:
+                    RESUME_FROM_CHECKPOINT = str(checkpoints[-1])
             if PUSH_TO_HUB:
                 require_hf_namespace(SFT_HF_REPO, token=HF_TOKEN)
             display(
@@ -956,9 +981,14 @@ nb3 = notebook(
                         "runtime": runtime.as_dict(),
                         "versions": versions,
                         "model": MODEL_ID,
-                        "local_dataset": str(SFT_DATA),
+                        "dataset_source_mode": SFT_DATA_SOURCE_MODE,
+                        "local_dataset": str(LOCAL_SFT_DATA),
                         "hub_dataset": f"{DATASET_HF_REPO}/{DATASET_CONFIG_NAME}",
                         "hub_model": SFT_HF_REPO,
+                        "max_sequence_length": MAX_SEQUENCE_LENGTH,
+                        "pad_to_multiple_of": PAD_TO_MULTIPLE_OF,
+                        "torch_empty_cache_steps": TORCH_EMPTY_CACHE_STEPS,
+                        "resume_from_checkpoint": RESUME_FROM_CHECKPOINT,
                     }
                 )
             )
@@ -974,9 +1004,19 @@ nb3 = notebook(
         ),
         code(
             """
-            if not SFT_DATA.exists():
-                raise RuntimeError("Run notebook 01 to create the SFT dataset.")
-            sft = load_from_disk(SFT_DATA)
+            if SFT_DATA_SOURCE_MODE == "hub":
+                sft = load_dataset(
+                    DATASET_HF_REPO,
+                    DATASET_CONFIG_NAME,
+                    token=HF_TOKEN,
+                )
+            else:
+                if not LOCAL_SFT_DATA.exists():
+                    raise RuntimeError(
+                        "LOCAL_SFT_DATA does not exist. Run notebook 01 or use "
+                        "SFT_DATA_SOURCE_MODE='hub'."
+                    )
+                sft = load_from_disk(LOCAL_SFT_DATA)
             if len(sft["train"]) == 0 or len(sft["validation"]) == 0:
                 raise RuntimeError("Both SFT train and validation splits must be non-empty.")
 
@@ -1055,6 +1095,7 @@ nb3 = notebook(
                 per_device_eval_batch_size=EVAL_BATCH_SIZE,
                 gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
                 max_length=MAX_SEQUENCE_LENGTH,
+                pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
                 completion_only_loss=COMPLETION_ONLY_LOSS,
                 loss_type=LOSS_TYPE,
                 gradient_checkpointing=GRADIENT_CHECKPOINTING,
@@ -1071,6 +1112,7 @@ nb3 = notebook(
                 logging_steps=LOGGING_STEPS,
                 logging_first_step=LOGGING_FIRST_STEP,
                 report_to=REPORT_TO,
+                torch_empty_cache_steps=TORCH_EMPTY_CACHE_STEPS,
                 dataloader_pin_memory=DATALOADER_PIN_MEMORY,
                 push_to_hub=PUSH_TO_HUB,
                 hub_model_id=SFT_HF_REPO,
@@ -1244,7 +1286,7 @@ nb4 = notebook(
             import matplotlib.pyplot as plt
             import pandas as pd
             from accelerate import PartialState
-            from datasets import load_from_disk
+            from datasets import load_dataset, load_from_disk
             from IPython.display import JSON, Markdown, display
             from peft import PeftModel
             from trl import GRPOConfig, GRPOTrainer
@@ -1269,16 +1311,18 @@ nb4 = notebook(
             if ROOT.name == "notebooks":
                 ROOT = ROOT.parent
 
-            # Runtime and local artifacts
+            # Runtime, input sources, and local artifacts
             ENABLE_MPS_FALLBACK = True
             TOKENIZERS_PARALLELISM = False
             if ENABLE_MPS_FALLBACK:
                 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
             os.environ["TOKENIZERS_PARALLELISM"] = str(TOKENIZERS_PARALLELISM).lower()
             MODEL_ID = "google/gemma-4-E4B-it"
-            SFT_ADAPTER_SOURCE = ROOT / "artifacts" / "gemma4-scientific-design-sft"
+            GRPO_DATA_SOURCE_MODE = "hub"  # "hub" or "local"
+            SFT_ADAPTER_SOURCE_MODE = "hub"  # "hub" or "local"
+            LOCAL_SFT_ADAPTER = ROOT / "artifacts" / "gemma4-scientific-design-sft"
+            LOCAL_GRPO_DATA = ROOT / "data" / "processed" / "scientific_design_grpo"
             GRPO_ADAPTER = ROOT / "artifacts" / "gemma4-scientific-design-grpo"
-            GRPO_DATA = ROOT / "data" / "processed" / "scientific_design_grpo"
             RESUME_FROM_CHECKPOINT = None
 
             # Exact Luna reward
@@ -1346,6 +1390,15 @@ nb4 = notebook(
             require_openai_key()
             versions = require_training_stack()
             runtime = detect_runtime()
+            if GRPO_DATA_SOURCE_MODE not in {"hub", "local"}:
+                raise ValueError("GRPO_DATA_SOURCE_MODE must be 'hub' or 'local'.")
+            if SFT_ADAPTER_SOURCE_MODE not in {"hub", "local"}:
+                raise ValueError("SFT_ADAPTER_SOURCE_MODE must be 'hub' or 'local'.")
+            SFT_ADAPTER_SOURCE = (
+                SFT_HF_REPO
+                if SFT_ADAPTER_SOURCE_MODE == "hub"
+                else LOCAL_SFT_ADAPTER
+            )
             DATALOADER_PIN_MEMORY = (
                 runtime.backend == "cuda" if PIN_MEMORY_ON_CUDA_ONLY else True
             )
@@ -1375,6 +1428,8 @@ nb4 = notebook(
                         "runtime": runtime.as_dict(),
                         "versions": versions,
                         "model": MODEL_ID,
+                        "grpo_dataset_source_mode": GRPO_DATA_SOURCE_MODE,
+                        "sft_adapter_source_mode": SFT_ADAPTER_SOURCE_MODE,
                         "sft_adapter": str(SFT_ADAPTER_SOURCE),
                         "judge_model": JUDGE_MODEL,
                         "reward_formula": "F * (0.10 + 0.90 * J)",
@@ -1394,12 +1449,27 @@ nb4 = notebook(
         ),
         code(
             """
-            if not GRPO_DATA.exists():
-                raise RuntimeError("Run notebook 02 to create the GRPO dataset.")
-            if isinstance(SFT_ADAPTER_SOURCE, Path) and not SFT_ADAPTER_SOURCE.exists():
-                raise RuntimeError("Run notebook 03 to create the SFT adapter.")
-
-            grpo = load_from_disk(GRPO_DATA)
+            if GRPO_DATA_SOURCE_MODE == "hub":
+                grpo = load_dataset(
+                    DATASET_HF_REPO,
+                    DATASET_CONFIG_NAME,
+                    token=HF_TOKEN,
+                )
+            else:
+                if not LOCAL_GRPO_DATA.exists():
+                    raise RuntimeError(
+                        "LOCAL_GRPO_DATA does not exist. Run notebook 02 or use "
+                        "GRPO_DATA_SOURCE_MODE='hub'."
+                    )
+                grpo = load_from_disk(LOCAL_GRPO_DATA)
+            if (
+                SFT_ADAPTER_SOURCE_MODE == "local"
+                and not LOCAL_SFT_ADAPTER.exists()
+            ):
+                raise RuntimeError(
+                    "LOCAL_SFT_ADAPTER does not exist. Run notebook 03 or use "
+                    "SFT_ADAPTER_SOURCE_MODE='hub'."
+                )
             if len(grpo["train"]) == 0 or len(grpo["validation"]) == 0:
                 raise RuntimeError("GRPO train and validation splits must be non-empty.")
 
