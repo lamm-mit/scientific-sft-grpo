@@ -2,25 +2,24 @@
 
 from .devices import RuntimeDevice, detect_runtime
 from .hub import require_hf_namespace
-from .judge import configure_mechanism_judge, mechanism_judge_reward
-from .rewards import (
-    answer_similarity_reward,
-    concept_coverage_reward,
-    evidence_grounding_reward,
-    format_reward,
+from .judge import (
+    ScientificDesignJudge,
+    configure_scientific_design_judge,
+    scientific_design_reward,
 )
-from .schemas import ScientificTaskDraft, ScientificTaskReview
+from .rewards import combined_reward, format_reward, parse_completion
+from .schemas import ScientificDesignTaskDraft, ScientificDesignTaskReview
 
 __all__ = [
     "RuntimeDevice",
-    "ScientificTaskDraft",
-    "ScientificTaskReview",
-    "answer_similarity_reward",
-    "concept_coverage_reward",
-    "configure_mechanism_judge",
+    "ScientificDesignJudge",
+    "ScientificDesignTaskDraft",
+    "ScientificDesignTaskReview",
+    "combined_reward",
+    "configure_scientific_design_judge",
     "detect_runtime",
-    "evidence_grounding_reward",
     "format_reward",
-    "mechanism_judge_reward",
+    "parse_completion",
     "require_hf_namespace",
+    "scientific_design_reward",
 ]

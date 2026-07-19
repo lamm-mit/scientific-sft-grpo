@@ -80,15 +80,25 @@ def generate_text(
     runtime: RuntimeDevice,
     *,
     max_new_tokens: int = 220,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
 ) -> str:
     model.eval()
     inputs = tokenizer(prompt, return_tensors="pt").to(runtime.device)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if do_sample:
+        generation_kwargs.update(
+            {
+                "temperature": temperature,
+                "top_p": top_p,
+            }
+        )
+    outputs = model.generate(**inputs, **generation_kwargs)
     continuation = outputs[0, inputs["input_ids"].shape[1] :]
     return tokenizer.decode(continuation, skip_special_tokens=True)

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -22,18 +24,33 @@ ALLOWED_LICENSES = {
     "PD",
 }
 
-SYSTEM_TASK = (
-    "Solve the self-contained scientific mechanism task. Explain the causal chain, quote "
-    "the most relevant observation already included in the task, and give a concise answer."
+TASK_FAMILIES = (
+    "mechanism_guided_design",
+    "experimental_design",
+    "troubleshooting",
+    "hypothesis_development",
+    "cross_domain_synthesis",
 )
 
-SPLIT_THRESHOLDS = (
-    ("sft_train", 50),
-    ("sft_validation", 60),
-    ("grpo_train", 80),
-    ("grpo_validation", 90),
-    ("test", 100),
+SYSTEM_TASK = (
+    "Solve the self-contained scientific problem-solving task. Develop several distinct "
+    "candidate ideas, identify the governing scientific principles and constraints, "
+    "synthesize the strongest direction, and give a concise final answer."
 )
+
+RESPONSE_INSTRUCTIONS = """Respond in exactly this order, with no text outside the tags:
+<brainstorm>
+three to five distinct candidate ideas
+</brainstorm>
+<principles>
+the scientific constraints and design principles
+</principles>
+<synthesis>
+compare or combine the candidates using the principles
+</synthesis>
+<answer>
+a concise final proposal or conclusion
+</answer>"""
 
 
 def normalize_whitespace(text: str) -> str:
@@ -57,13 +74,96 @@ def _metadata(record: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def assign_paper_split(paper_id: str, seed: int = 17) -> str:
-    digest = hashlib.sha256(f"{seed}:{paper_id}".encode()).digest()
-    bucket = int.from_bytes(digest[:8], "big") % 100
-    for name, upper in SPLIT_THRESHOLDS:
-        if bucket < upper:
-            return name
-    raise AssertionError(bucket)
+def allocate_task_quotas(
+    split_targets: Mapping[str, int],
+    task_family_weights: Mapping[str, float],
+) -> dict[tuple[str, str], int]:
+    """Allocate exact integer family quotas inside each requested split."""
+
+    if not split_targets or any(int(value) < 0 for value in split_targets.values()):
+        raise ValueError("Split targets must be a non-empty mapping of non-negative counts.")
+    if set(task_family_weights) != set(TASK_FAMILIES):
+        raise ValueError(f"Task-family weights must define exactly: {TASK_FAMILIES}")
+    if any(float(value) < 0 for value in task_family_weights.values()):
+        raise ValueError("Task-family weights cannot be negative.")
+    weight_total = sum(float(value) for value in task_family_weights.values())
+    if weight_total <= 0:
+        raise ValueError("At least one task-family weight must be positive.")
+
+    allocation: dict[tuple[str, str], int] = {}
+    for split, target_value in split_targets.items():
+        target = int(target_value)
+        raw = {
+            family: target * float(weight) / weight_total
+            for family, weight in task_family_weights.items()
+        }
+        counts = {family: math.floor(value) for family, value in raw.items()}
+        remainder = target - sum(counts.values())
+        ranked = sorted(
+            TASK_FAMILIES,
+            key=lambda family: (-(raw[family] - counts[family]), family),
+        )
+        for family in ranked[:remainder]:
+            counts[family] += 1
+        for family in TASK_FAMILIES:
+            allocation[(str(split), family)] = counts[family]
+    return allocation
+
+
+def task_quota_status(
+    records: Iterable[dict[str, Any]],
+    split_targets: Mapping[str, int],
+    task_family_weights: Mapping[str, float],
+) -> dict[str, Any]:
+    targets = allocate_task_quotas(split_targets, task_family_weights)
+    observed = Counter(
+        (str(record.get("split", "")), str(record.get("task_family", "")))
+        for record in records
+    )
+    deficits = {
+        key: max(target - observed[key], 0)
+        for key, target in targets.items()
+        if observed[key] < target
+    }
+    return {
+        "target_total": sum(targets.values()),
+        "accepted_total": sum(
+            min(observed[key], target) for key, target in targets.items()
+        ),
+        "complete": not deficits,
+        "targets": targets,
+        "observed": dict(observed),
+        "deficits": deficits,
+    }
+
+
+def trim_records_to_quotas(
+    records: Iterable[dict[str, Any]],
+    split_targets: Mapping[str, int],
+    task_family_weights: Mapping[str, float],
+) -> list[dict[str, Any]]:
+    """Select a deterministic, exact quota-conforming subset of accepted records."""
+
+    targets = allocate_task_quotas(split_targets, task_family_weights)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {
+        key: [] for key in targets
+    }
+    for record in records:
+        key = (str(record.get("split", "")), str(record.get("task_family", "")))
+        if key in grouped:
+            grouped[key].append(record)
+
+    selected: list[dict[str, Any]] = []
+    for key, target in targets.items():
+        rows = sorted(
+            grouped[key],
+            key=lambda record: (
+                str(record.get("task_id", "")),
+                str(record.get("paper_id", "")),
+            ),
+        )
+        selected.extend(rows[:target])
+    return sorted(selected, key=lambda record: str(record.get("task_id", "")))
 
 
 def _source_excerpt(text: str, *, min_chars: int, max_chars: int) -> str | None:
@@ -87,18 +187,20 @@ def stream_open_science_sources(
     *,
     dataset_id: str = "common-pile/peS2o",
     split: str = "train",
-    max_papers: int = 120,
-    max_scanned: int = 20_000,
+    max_papers: int = 2_500,
+    max_scanned: int = 200_000,
     min_chars: int = 1_200,
     max_chars: int = 6_000,
     seed: int = 17,
+    exclude_paper_ids: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
-    """Stream a small license-filtered classroom sample of scientific text."""
+    """Stream a license-filtered scientific source pool for task authoring."""
 
     stream = load_dataset(dataset_id, split=split, streaming=True)
-    stream = stream.shuffle(seed=seed, buffer_size=min(max_scanned, 10_000))
+    stream = stream.shuffle(seed=seed, buffer_size=min(max_scanned, 20_000))
     records: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    excluded = {str(value) for value in exclude_paper_ids}
+    seen = set(excluded)
 
     for index, row in enumerate(stream):
         if index >= max_scanned or len(records) >= max_papers:
@@ -136,10 +238,10 @@ def stream_open_science_sources(
                 "title": normalize_whitespace(title)[:300],
                 "source_text": source_text,
                 "source_dataset": dataset_id,
+                "source_split": split,
                 "source_url": str(meta.get("oa_url") or meta.get("url") or ""),
                 "source_license": str(license_raw),
                 "source_license_normalized": license_normalized,
-                "split": assign_paper_split(paper_id, seed),
                 "source_sha256": hashlib.sha256(source_text.encode()).hexdigest(),
             }
         )
@@ -153,22 +255,24 @@ def task_prompt(task: str) -> list[dict[str, str]]:
         {
             "role": "user",
             "content": (
-                "SCIENTIFIC MECHANISM TASK\n"
+                "SCIENTIFIC PROBLEM-SOLVING TASK\n"
                 f"{task}\n\n"
-                "Respond in exactly this order:\n"
-                "<reasoning>brief visible rationale</reasoning>\n"
-                "<evidence>exact observation quoted from the task</evidence>\n"
-                "<answer>concise mechanistic answer</answer>"
+                f"{RESPONSE_INSTRUCTIONS}"
             ),
         },
     ]
 
 
+def _render_list(items: list[str]) -> str:
+    return "\n".join(f"- {item}" for item in items)
+
+
 def render_completion(record: dict[str, Any]) -> str:
     return (
-        f"<reasoning>{record['reasoning']}</reasoning>\n"
-        f"<evidence>{record['evidence']}</evidence>\n"
-        f"<answer>{record['answer']}</answer>"
+        f"<brainstorm>\n{_render_list(record['brainstorm'])}\n</brainstorm>\n"
+        f"<principles>\n{_render_list(record['principles'])}\n</principles>\n"
+        f"<synthesis>\n{record['synthesis']}\n</synthesis>\n"
+        f"<answer>\n{record['answer']}\n</answer>"
     )
 
 
@@ -176,6 +280,7 @@ def canonical_to_sft(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "task_id": record["task_id"],
         "paper_id": record["paper_id"],
+        "task_family": record["task_family"],
         "prompt": task_prompt(record["task"]),
         "completion": [{"role": "assistant", "content": render_completion(record)}],
         "source_license": record["source_license"],
@@ -187,14 +292,13 @@ def canonical_to_grpo(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "task_id": record["task_id"],
         "paper_id": record["paper_id"],
+        "task_family": record["task_family"],
         "prompt": task_prompt(record["task"]),
         "task": record["task"],
-        "reference_reasoning": record["reasoning"],
-        "reference_answer": record["answer"],
-        "reference_evidence": record["evidence"],
-        "mechanism_steps": record["mechanism_steps"],
-        "causal_links": record["causal_links"],
-        "required_concepts": record["required_concepts"],
+        "required_constraints": record["required_constraints"],
+        "evaluation_criteria": record["evaluation_criteria"],
+        "acceptable_alternatives": record["acceptable_alternatives"],
+        "failure_modes": record["failure_modes"],
         "source_license": record["source_license"],
         "source_url": record["source_url"],
     }

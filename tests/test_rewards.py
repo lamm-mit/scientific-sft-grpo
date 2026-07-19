@@ -1,60 +1,63 @@
+import pytest
+
 from science_course.rewards import (
-    answer_similarity_reward,
-    component_scores,
-    concept_coverage_reward,
-    evidence_grounding_reward,
+    combined_reward,
     format_reward,
     parse_completion,
-    token_f1,
+    semantic_score_from_judgment,
 )
 
-GOOD = """<reasoning>Heating disrupts reversible bonds, allowing chains to move;
-cooling reforms the bonds.</reasoning>
-<evidence>cooling restores the bonds</evidence>
-<answer>Reversible bond breaking enables reshaping, while bond reformation
-restores strength.</answer>"""
+GOOD = """<brainstorm>
+- Use reversible host-guest crosslinks.
+- Use dynamic ionic clusters.
+- Use protected hydrogen-bonding domains.
+</brainstorm>
+<principles>
+- Crosslinks must break reversibly.
+- Chains need mobility.
+- Binding partners must reassociate in water.
+</principles>
+<synthesis>
+Use a flexible permanent network with reversible host-guest crosslinks.
+</synthesis>
+<answer>
+The reversible crosslinks dissipate energy and reform after strain.
+</answer>"""
 
-TASK = (
-    "A polymer contains chains connected by reversible hydrogen bonds. Heating temporarily "
-    "disrupts these bonds and increases chain mobility; cooling restores the bonds. Explain "
-    "why the material can be reshaped and then recover strength."
-)
 
-
-def test_parse_completion():
-    assert parse_completion(GOOD)["answer"].startswith("Reversible bond")
+def test_parse_completion_requires_four_nonempty_ordered_sections():
+    parsed = parse_completion(GOOD)
+    assert parsed is not None
+    assert parsed["answer"].startswith("The reversible")
     assert parse_completion("<answer>A</answer>") is None
+    assert parse_completion(GOOD.replace("Chains need mobility.", "")) is not None
+    assert parse_completion(GOOD.replace("Use a flexible permanent network", "")) is not None
+    assert parse_completion(GOOD.replace("<synthesis>", "<synthesis></synthesis>")) is None
 
 
-def test_reward_components():
-    assert format_reward([GOOD]) == [1.0]
-    assert evidence_grounding_reward([GOOD], [TASK]) == [1.0]
-    assert concept_coverage_reward(
-        [GOOD], [["reversible bonds", "chains"]]
-    ) == [1.0]
-    assert answer_similarity_reward(
-        [GOOD],
-        [
-            "Reversible bond breaking enables reshaping, while bond reformation "
-            "restores strength."
-        ],
-    ) == [1.0]
+def test_format_reward_is_binary():
+    assert format_reward([GOOD, "<answer>wrong format</answer>"]) == [1.0, 0.0]
 
 
-def test_fabricated_evidence_gets_no_grounding_reward():
-    bad = GOOD.replace("cooling restores the bonds", "cooling creates covalent bonds", 1)
-    assert evidence_grounding_reward([bad], [TASK]) == [0.0]
-
-
-def test_component_scores_and_f1_bounds():
-    scores = component_scores(
-        GOOD,
-        task=TASK,
-        reference_answer=(
-            "Reversible bond breaking enables reshaping and reformation restores strength."
-        ),
-        required_concepts=["reversible bonds", "chain mobility"],
+def test_semantic_score_is_exact_average_of_four_zero_to_four_scores():
+    score = semantic_score_from_judgment(
+        {
+            "brainstorm": 3,
+            "principles": 4,
+            "synthesis": 3,
+            "answer": 4,
+        }
     )
-    assert set(scores) == {"format", "evidence", "concepts", "similarity"}
-    assert all(0.0 <= value <= 1.0 for value in scores.values())
-    assert 0.0 < token_f1("bonds reform", "reversible bonds reform on cooling") < 1.0
+    assert score == 0.875
+
+
+def test_combined_reward_matches_documented_formula():
+    assert combined_reward(1.0, 0.875) == pytest.approx(0.8875)
+    assert combined_reward(0.0, 1.0) == 0.0
+    with pytest.raises(ValueError, match="sum to 1"):
+        combined_reward(
+            1.0,
+            0.5,
+            format_base_reward=0.2,
+            semantic_reward_weight=0.9,
+        )

@@ -7,29 +7,38 @@ from typing import Any
 
 from openai import OpenAI
 
-from .rewards import completion_text
-from .schemas import MechanismJudgmentBatch
-from .teacher import (
-    DEFAULT_TEACHER_MODEL,
-    parse_structured_response,
-    require_openai_key,
-    response_usage,
+from .rewards import (
+    combined_reward,
+    completion_text,
+    format_reward,
+    semantic_score_from_judgment,
 )
+from .schemas import ScientificDesignJudgmentBatch
+from .teacher import parse_structured_response, require_openai_key, response_usage
 
-JUDGE_PROMPT_VERSION = "mechanism-judge-v1"
+DEFAULT_JUDGE_MODEL = "gpt-5.6-luna"
+JUDGE_PROMPT_VERSION = "scientific-design-judge-v2"
 
-JUDGE_SYSTEM = """You are a strict grader of scientific mechanism explanations.
+JUDGE_SYSTEM = """You are a strict but open-minded grader of scientific problem solving.
 
-For every item, evaluate the student's response against the self-contained task and
-hidden causal rubric. Reward a scientifically correct causal chain: the initiating
-condition or perturbation, relevant intermediate processes, and the resulting outcome.
-Paraphrases are valid. Do not reward mere keyword overlap, unsupported causal claims,
-or a correct final claim reached through incorrect reasoning.
+For every item, score the student's structured response independently on four dimensions.
+Use integer scores from 0 to 4:
+0 = missing, irrelevant, or scientifically wrong
+1 = weak, with major omissions or errors
+2 = adequate but incomplete
+3 = strong and mostly complete
+4 = excellent, coherent, and scientifically defensible
 
-Score causal_correctness, completeness, evidence_use, and overall_score from 0 to 1.
-Evidence must be quoted from the task and used consistently with the causal explanation.
-The task is qualitative: never require a numerical result. Return exactly one judgment
-for each item_index."""
+Dimensions:
+- brainstorm: distinct, relevant, scientifically plausible candidate ideas;
+- principles: appropriate scientific constraints and design principles;
+- synthesis: candidates are compared or combined coherently using the principles;
+- answer: the final proposal is scientifically sound and directly answers the task.
+
+Use the hidden rubric as criteria, not as a phrase-matching answer key. Accept scientifically
+valid alternatives. Penalize unsupported claims, violated constraints, contradictions,
+trivial variations presented as different ideas, and synthesis that does not support the
+answer. Return exactly one judgment for every item_index."""
 
 
 def _cache_key(model: str, item: dict[str, Any]) -> str:
@@ -63,23 +72,30 @@ def _append_cache(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-class MechanismJudge:
-    """Batched, cached LLM judge used as the semantic GRPO reward."""
+class ScientificDesignJudge:
+    """Batched, cached Luna judge for the four scientific work-product sections."""
 
     def __init__(
         self,
         *,
-        model: str = DEFAULT_TEACHER_MODEL,
-        cache_path: str | Path = "results/grpo_judge_cache.jsonl",
+        model: str = DEFAULT_JUDGE_MODEL,
+        cache_path: str | Path = "results/scientific_design_judge_cache.jsonl",
+        api_max_retries: int = 3,
+        api_timeout_seconds: float = 120.0,
         client: OpenAI | None = None,
     ) -> None:
         require_openai_key()
         self.model = model
         self.cache_path = Path(cache_path)
-        self.client = client or OpenAI(max_retries=3, timeout=120.0)
+        if api_max_retries < 0 or api_timeout_seconds <= 0:
+            raise ValueError("OpenAI retry and timeout settings must be non-negative.")
+        self.client = client or OpenAI(
+            max_retries=api_max_retries,
+            timeout=api_timeout_seconds,
+        )
         self.cache = _load_cache(self.cache_path)
 
-    def score(self, items: list[dict[str, Any]]) -> list[float]:
+    def judgments(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         keys = [_cache_key(self.model, item) for item in items]
         missing_indices = [
             index for index, key in enumerate(keys) if key not in self.cache
@@ -96,21 +112,24 @@ class MechanismJudge:
                     {
                         "role": "user",
                         "content": (
-                            "Grade this JSON batch. The reference is a rubric, not a phrase "
-                            "matching target.\n\n"
+                            "Grade this JSON batch. Score each response independently and "
+                            "allow valid alternatives.\n\n"
                             + json.dumps(judge_items, ensure_ascii=False)
                         ),
                     },
                 ],
-                text_format=MechanismJudgmentBatch,
+                text_format=ScientificDesignJudgmentBatch,
                 store=False,
             )
-            parsed = parse_structured_response(response, MechanismJudgmentBatch)
+            parsed = parse_structured_response(
+                response,
+                ScientificDesignJudgmentBatch,
+            )
             judgments = {item.item_index: item for item in parsed.judgments}
             expected = set(missing_indices)
             if set(judgments) != expected or len(parsed.judgments) != len(expected):
                 raise RuntimeError(
-                    "Mechanism judge returned unexpected item indexes: "
+                    "Scientific design judge returned unexpected item indexes: "
                     f"expected {sorted(expected)}, received {sorted(judgments)}"
                 )
 
@@ -133,71 +152,89 @@ class MechanismJudge:
                 rows.append(row)
             _append_cache(self.cache_path, rows)
 
+        return [dict(self.cache[key]["judgment"]) for key in keys]
+
+    def score(self, items: list[dict[str, Any]]) -> list[float]:
         return [
-            float(self.cache[key]["judgment"]["overall_score"])
-            for key in keys
+            semantic_score_from_judgment(judgment)
+            for judgment in self.judgments(items)
         ]
 
 
-_DEFAULT_JUDGE: MechanismJudge | None = None
+_DEFAULT_JUDGE: ScientificDesignJudge | None = None
+_FORMAT_BASE_REWARD = 0.10
+_SEMANTIC_REWARD_WEIGHT = 0.90
 
 
-def configure_mechanism_judge(
+def configure_scientific_design_judge(
     *,
-    model: str = DEFAULT_TEACHER_MODEL,
-    cache_path: str | Path = "results/grpo_judge_cache.jsonl",
+    model: str = DEFAULT_JUDGE_MODEL,
+    cache_path: str | Path = "results/scientific_design_judge_cache.jsonl",
+    format_base_reward: float = 0.10,
+    semantic_reward_weight: float = 0.90,
+    api_max_retries: int = 3,
+    api_timeout_seconds: float = 120.0,
     client: OpenAI | None = None,
-) -> MechanismJudge:
-    """Configure the singleton used by the TRL-compatible judge reward."""
+) -> ScientificDesignJudge:
+    """Configure the singleton used by the TRL-compatible combined reward."""
 
-    global _DEFAULT_JUDGE
-    _DEFAULT_JUDGE = MechanismJudge(
+    combined_reward(
+        1.0,
+        0.0,
+        format_base_reward=format_base_reward,
+        semantic_reward_weight=semantic_reward_weight,
+    )
+    global _DEFAULT_JUDGE, _FORMAT_BASE_REWARD, _SEMANTIC_REWARD_WEIGHT
+    _DEFAULT_JUDGE = ScientificDesignJudge(
         model=model,
         cache_path=cache_path,
+        api_max_retries=api_max_retries,
+        api_timeout_seconds=api_timeout_seconds,
         client=client,
     )
+    _FORMAT_BASE_REWARD = format_base_reward
+    _SEMANTIC_REWARD_WEIGHT = semantic_reward_weight
     return _DEFAULT_JUDGE
 
 
-def mechanism_judge_reward(
+def scientific_design_reward(
     completions: list[Any],
     task: list[str],
-    reference_reasoning: list[str],
-    reference_answer: list[str],
-    mechanism_steps: list[list[str]],
-    causal_links: list[list[dict[str, str]]],
+    required_constraints: list[list[str]],
+    evaluation_criteria: list[list[str]],
+    acceptable_alternatives: list[list[str]],
+    failure_modes: list[list[str]],
     **_: Any,
 ) -> list[float]:
-    """TRL-compatible semantic reward; one cached API request per reward batch."""
+    """Compute F × (0.10 + 0.90J), skipping API calls for malformed outputs."""
 
     global _DEFAULT_JUDGE
     if _DEFAULT_JUDGE is None:
-        _DEFAULT_JUDGE = MechanismJudge()
+        _DEFAULT_JUDGE = ScientificDesignJudge()
 
+    format_scores = format_reward(completions)
+    valid_indices = [
+        index for index, score in enumerate(format_scores) if score == 1.0
+    ]
     items = [
         {
-            "task": current_task,
-            "reference_reasoning": current_reasoning,
-            "reference_answer": current_answer,
-            "mechanism_steps": current_steps,
-            "causal_links": current_links,
-            "student_response": completion_text(completion),
+            "task": task[index],
+            "required_constraints": required_constraints[index],
+            "evaluation_criteria": evaluation_criteria[index],
+            "acceptable_alternatives": acceptable_alternatives[index],
+            "failure_modes": failure_modes[index],
+            "student_response": completion_text(completions[index]),
         }
-        for (
-            completion,
-            current_task,
-            current_reasoning,
-            current_answer,
-            current_steps,
-            current_links,
-        ) in zip(
-            completions,
-            task,
-            reference_reasoning,
-            reference_answer,
-            mechanism_steps,
-            causal_links,
-            strict=True,
-        )
+        for index in valid_indices
     ]
-    return _DEFAULT_JUDGE.score(items)
+    semantic_scores = _DEFAULT_JUDGE.score(items) if items else []
+    semantic_by_index = dict(zip(valid_indices, semantic_scores, strict=True))
+    return [
+        combined_reward(
+            format_score,
+            semantic_by_index.get(index, 0.0),
+            format_base_reward=_FORMAT_BASE_REWARD,
+            semantic_reward_weight=_SEMANTIC_REWARD_WEIGHT,
+        )
+        for index, format_score in enumerate(format_scores)
+    ]

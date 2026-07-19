@@ -22,7 +22,7 @@ def notebook(cells: list):
         cells=cells,
         metadata={
             "kernelspec": {
-                "display_name": "Python 3 (scientific-sft-grpo-course)",
+                "display_name": "Python 3 (scientific-sft-grpo)",
                 "language": "python",
                 "name": "python3",
             },
@@ -43,32 +43,27 @@ nb1 = notebook(
     [
         markdown(
             """
-            # 01 — Build an SFT dataset for scientific mechanisms
+            # 01 — Generate the scientific problem-solving SFT dataset
 
-            **Learning goal.** Turn openly licensed scientific source material into
-            self-contained *how/why* tasks. A teacher model drafts each task; a separate
-            critic call checks it against the source. The student never sees the source.
+            The student model receives a **task only**—never a paper passage. Openly licensed
+            scientific text is authoring material for `gpt-5.6-terra`, which creates a new,
+            self-contained task and one strong structured work product:
 
-            ```
-            open scientific source
-                    │  teacher + critic (gpt-5.6-terra)
-                    ▼
-            self-contained mechanism task
-                    │
-                    ├── visible causal explanation
-                    ├── evidence quoted from the task
-                    └── concise mechanistic answer
+            ```text
+            <brainstorm>distinct candidate ideas</brainstorm>
+            <principles>scientific constraints and design principles</principles>
+            <synthesis>comparison or integration of the candidates</synthesis>
+            <answer>concise final proposal or conclusion</answer>
             ```
 
-            This course deliberately excludes calculation and numerical prediction tasks.
-            The target is a causal chain: **condition → intermediate process → outcome**.
+            A second critic call checks every generated record against the source. The
+            generator continues until the requested number of **accepted** examples is
+            available in every task family and SFT split.
             """
         ),
         markdown(
             """
             ## Before you run
-
-            From the repository root:
 
             ```bash
             python3.12 -m venv .venv
@@ -80,23 +75,23 @@ nb1 = notebook(
             jupyter lab
             ```
 
-            The generation is real, paid API use—there is no offline substitute. Each source
-            normally uses two calls (teacher and critic). Results are appended incrementally,
-            so interrupting and rerunning is safe.
+            Generation is real API use. Drafts and rejections are appended incrementally, so
+            interruption and rerun are safe. Increasing the targets may require increasing
+            the source pool and generation-attempt budget.
             """
         ),
         markdown(
             """
             ## Configuration
 
-            Every editable setting is defined below. The OpenAI key is the only required
-            environment variable. Hugging Face uses `hf auth login` by default; the commented
-            `HF_TOKEN` line is an optional alternative and should never contain a pasted token.
+            Every editable non-secret parameter is below. Only `OPENAI_API_KEY` is required
+            from the environment. Hugging Face uses cached `hf auth login` credentials unless
+            the optional token line is deliberately uncommented.
             """
         ),
         code(
             """
-            import os
+            import shutil
             from pathlib import Path
 
             import matplotlib.pyplot as plt
@@ -105,13 +100,17 @@ nb1 = notebook(
             from IPython.display import JSON, Markdown, display
 
             from science_course.data import (
+                TASK_FAMILIES,
+                allocate_task_quotas,
                 build_sft_dataset,
                 read_jsonl,
                 stream_open_science_sources,
+                task_quota_status,
                 write_jsonl,
             )
             from science_course.hub import require_hf_namespace
             from science_course.teacher import (
+                DEFAULT_CRITIC_MODEL,
                 DEFAULT_TEACHER_MODEL,
                 generate_canonical_tasks,
                 require_openai_key,
@@ -121,175 +120,71 @@ nb1 = notebook(
             if ROOT.name == "notebooks":
                 ROOT = ROOT.parent
             DATA = ROOT / "data"
-            RAW_SOURCES = DATA / "raw" / "open_science_sources.jsonl"
-            ACCEPTED = DATA / "canonical" / "mechanism_tasks.jsonl"
-            REJECTED = DATA / "canonical" / "rejected_tasks.jsonl"
-            SFT_DISK = DATA / "processed" / "sft"
 
-            # Dataset authoring
+            # Local artifacts: v2 paths prevent accidental reuse of the earlier QA dataset
+            RAW_SOURCES = DATA / "raw" / "scientific_design_sft_sources.jsonl"
+            ACCEPTED = DATA / "canonical" / "scientific_design_sft_tasks.jsonl"
+            REJECTED = DATA / "canonical" / "scientific_design_sft_rejected.jsonl"
+            SFT_DISK = DATA / "processed" / "scientific_design_sft"
+
+            # Teacher and independent critic
             TEACHER_MODEL = DEFAULT_TEACHER_MODEL
+            CRITIC_MODEL = DEFAULT_CRITIC_MODEL
+
+            # Exact accepted-example targets
+            SFT_SPLIT_TARGETS = {
+                "sft_train": 500,
+                "sft_validation": 75,
+            }
+            TASK_FAMILY_WEIGHTS = {
+                "mechanism_guided_design": 0.25,
+                "experimental_design": 0.25,
+                "troubleshooting": 0.20,
+                "hypothesis_development": 0.15,
+                "cross_domain_synthesis": 0.15,
+            }
+
+            # Open scientific source pool
             SOURCE_DATASET_ID = "common-pile/peS2o"
             SOURCE_SPLIT = "train"
-            MAX_SOURCE_PAPERS = 120
-            MAX_SOURCE_RECORDS_SCANNED = 20_000
+            SOURCE_CANDIDATE_LIMIT = 2_500
+            MAX_SOURCE_RECORDS_SCANNED = 200_000
             MIN_SOURCE_CHARS = 1_200
             MAX_SOURCE_CHARS = 6_000
             RANDOM_SEED = 17
 
+            # Resumable API generation
+            GENERATION_CONCURRENCY = 8
+            MAX_GENERATION_ATTEMPTS = 2_500
+            OPENAI_MAX_RETRIES = 3
+            OPENAI_TIMEOUT_SECONDS = 120.0
+
             # Hugging Face publication
             DATASET_HF_REPO = "lamm-mit/scientific-sft-grpo-data"
+            DATASET_CONFIG_NAME = "scientific_design_sft"
             PUSH_DATASETS_TO_HUB = True
             DATASET_PRIVATE = False
             HF_TOKEN = None
-            # HF_TOKEN = os.environ["HF_TOKEN"]  # Optional; prefer `hf auth login`.
+            # HF_TOKEN = __import__("os").environ["HF_TOKEN"]  # Optional; prefer `hf auth login`.
 
             require_openai_key()
-            assert TEACHER_MODEL == "gpt-5.6-terra", (
-                "This class notebook is tested with the requested teacher model: "
-                "gpt-5.6-terra"
-            )
+            if set(TASK_FAMILY_WEIGHTS) != set(TASK_FAMILIES):
+                raise ValueError(f"Define weights for exactly these families: {TASK_FAMILIES}")
             if PUSH_DATASETS_TO_HUB:
                 require_hf_namespace(DATASET_HF_REPO, token=HF_TOKEN)
 
             sns.set_theme(style="whitegrid", context="talk")
-            print(
-                {
-                    "root": str(ROOT),
-                    "teacher_model": TEACHER_MODEL,
-                    "sources": MAX_SOURCE_PAPERS,
-                    "dataset_hub_repo": DATASET_HF_REPO,
-                }
-            )
-            """
-        ),
-        markdown(
-            """
-            ## 1. Acquire open source material
-
-            We stream `common-pile/peS2o`, derived from openly licensed scientific papers.
-            Per-document license metadata is filtered before any teacher call. Only a bounded
-            source excerpt is sent to the teacher; the record retains its paper ID, URL,
-            license, split, and content hash for provenance.
-
-            This source text is **authoring material**, not model input after fine-tuning.
-            """
-        ),
-        code(
-            """
-            cached_sources = read_jsonl(RAW_SOURCES)
-            if len(cached_sources) == MAX_SOURCE_PAPERS:
-                sources = cached_sources
-                print(f"Reusing {len(sources)} source records from {RAW_SOURCES}")
-            else:
-                sources = stream_open_science_sources(
-                    dataset_id=SOURCE_DATASET_ID,
-                    split=SOURCE_SPLIT,
-                    max_papers=MAX_SOURCE_PAPERS,
-                    max_scanned=MAX_SOURCE_RECORDS_SCANNED,
-                    min_chars=MIN_SOURCE_CHARS,
-                    max_chars=MAX_SOURCE_CHARS,
-                    seed=RANDOM_SEED,
-                )
-                write_jsonl(RAW_SOURCES, sources)
-                print(
-                    f"Refreshed the source cache with {len(sources)} records at {RAW_SOURCES}"
-                )
-
-            if not sources:
-                raise RuntimeError(
-                    "No open sources passed the filters. Increase MAX_SOURCE_PAPERS and "
-                    "rerun acquisition."
-                )
-
-            source_frame = pd.DataFrame(sources)
-            display(
-                source_frame[
-                    ["paper_id", "title", "source_license", "split", "source_url"]
-                ].head()
-            )
-            """
-        ),
-        code(
-            """
-            fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-            source_frame["source_license"].value_counts().plot.bar(
-                ax=axes[0], color="#315c8c", title="Open-license provenance"
-            )
-            source_frame["split"].value_counts().reindex(
-                ["sft_train", "sft_validation", "grpo_train", "grpo_validation", "test"]
-            ).plot.bar(ax=axes[1], color="#d97732", title="Paper-level split")
-            for ax in axes:
-                ax.set_xlabel("")
-                ax.tick_params(axis="x", rotation=35)
-            plt.tight_layout()
-            plt.show()
-            """
-        ),
-        markdown(
-            """
-            ## 2. Author and critique mechanism tasks
-
-            The teacher produces a structured record. It must:
-
-            - ask a qualitative **how/why** question;
-            - include every observation needed to answer;
-            - provide an ordered causal rubric and explicit cause→effect links;
-            - quote evidence from the newly written task itself; and
-            - avoid arithmetic, numerical targets, and unsupported claims.
-
-            A second call sees both the source and draft and can reject it. Rejections are
-            useful audit data, not silently discarded failures.
-            """
-        ),
-        code(
-            """
-            canonical_all = generate_canonical_tasks(
-                sources,
-                accepted_path=ACCEPTED,
-                rejected_path=REJECTED,
-                model=TEACHER_MODEL,
-            )
-            active_paper_ids = {row["paper_id"] for row in sources}
-            canonical = [
-                row for row in canonical_all if row["paper_id"] in active_paper_ids
-            ]
-            rejected = [
-                row
-                for row in read_jsonl(REJECTED)
-                if row.get("paper_id") in active_paper_ids
-            ]
-            print(
-                {
-                    "accepted": len(canonical),
-                    "rejected": len(rejected),
-                    "acceptance_rate": len(canonical) / max(len(canonical) + len(rejected), 1),
-                }
-            )
-
-            if not canonical:
-                raise RuntimeError("No tasks were accepted. Inspect the rejection audit file.")
-            """
-        ),
-        code(
-            """
-            example = canonical[0]
-            display(Markdown("### Student-visible task"))
-            display(Markdown(example["task"]))
-            display(Markdown("### Reference response"))
-            display(
-                Markdown(
-                    f"**Reasoning:** {example['reasoning']}\\n\\n"
-                    f"**Evidence:** “{example['evidence']}”\\n\\n"
-                    f"**Answer:** {example['answer']}"
-                )
-            )
-            display(Markdown("### Hidden causal rubric"))
             display(
                 JSON(
                     {
-                        "mechanism_steps": example["mechanism_steps"],
-                        "causal_links": example["causal_links"],
-                        "required_concepts": example["required_concepts"],
+                        "teacher_model": TEACHER_MODEL,
+                        "critic_model": CRITIC_MODEL,
+                        "accepted_targets": SFT_SPLIT_TARGETS,
+                        "accepted_total": sum(SFT_SPLIT_TARGETS.values()),
+                        "source_candidates": SOURCE_CANDIDATE_LIMIT,
+                        "generation_concurrency": GENERATION_CONCURRENCY,
+                        "dataset_hub_repo": DATASET_HF_REPO,
+                        "dataset_config": DATASET_CONFIG_NAME,
                     }
                 )
             )
@@ -297,74 +192,236 @@ nb1 = notebook(
         ),
         markdown(
             """
-            ## 3. Audit causal structure
+            ## 1. Acquire open scientific authoring material
 
-            This plot does not claim that a longer explanation is better. It checks whether
-            the dataset contains explicit multi-step causal supervision rather than isolated
-            answer labels.
+            Only license-filtered source excerpts are sent to the teacher. Paper ID, URL,
+            license, and content hash are retained locally for provenance. The source text is
+            never placed in the student prompt or published training projection.
             """
         ),
         code(
             """
-            audit = pd.DataFrame(
-                {
-                    "split": [row["split"] for row in canonical],
-                    "task_chars": [len(row["task"]) for row in canonical],
-                    "mechanism_steps": [len(row["mechanism_steps"]) for row in canonical],
-                    "causal_links": [len(row["causal_links"]) for row in canonical],
-                }
+            cached_sources = read_jsonl(RAW_SOURCES)
+            cache_is_usable = (
+                len(cached_sources) == SOURCE_CANDIDATE_LIMIT
+                and all(
+                    row.get("source_dataset") == SOURCE_DATASET_ID
+                    and row.get("source_split") == SOURCE_SPLIT
+                    for row in cached_sources
+                )
             )
-            fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-            sns.histplot(audit, x="mechanism_steps", discrete=True, ax=axes[0], color="#315c8c")
-            axes[0].set_title("Explicit steps per causal rubric")
-            sns.scatterplot(
-                audit,
-                x="task_chars",
-                y="causal_links",
+            if cache_is_usable:
+                sources = cached_sources
+                print(f"Reusing {len(sources)} cached sources from {RAW_SOURCES}")
+            else:
+                sources = stream_open_science_sources(
+                    dataset_id=SOURCE_DATASET_ID,
+                    split=SOURCE_SPLIT,
+                    max_papers=SOURCE_CANDIDATE_LIMIT,
+                    max_scanned=MAX_SOURCE_RECORDS_SCANNED,
+                    min_chars=MIN_SOURCE_CHARS,
+                    max_chars=MAX_SOURCE_CHARS,
+                    seed=RANDOM_SEED,
+                )
+                write_jsonl(RAW_SOURCES, sources)
+                print(f"Cached {len(sources)} source candidates at {RAW_SOURCES}")
+
+            if len(sources) < sum(SFT_SPLIT_TARGETS.values()):
+                raise RuntimeError(
+                    "The source pool is smaller than the accepted-example target. "
+                    "Increase SOURCE_CANDIDATE_LIMIT."
+                )
+            source_frame = pd.DataFrame(sources)
+            display(
+                source_frame[
+                    ["paper_id", "title", "source_license", "source_url"]
+                ].head()
+            )
+            """
+        ),
+        code(
+            """
+            quota = allocate_task_quotas(SFT_SPLIT_TARGETS, TASK_FAMILY_WEIGHTS)
+            quota_frame = pd.DataFrame(
+                [
+                    {"split": split, "task_family": family, "target": target}
+                    for (split, family), target in quota.items()
+                ]
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+            source_frame["source_license"].value_counts().head(12).plot.bar(
+                ax=axes[0], color="#315c8c", title="Open-license provenance"
+            )
+            sns.barplot(
+                quota_frame,
+                x="task_family",
+                y="target",
                 hue="split",
                 ax=axes[1],
-                s=80,
             )
-            axes[1].set_title("Task size versus cause→effect links")
+            axes[1].set_title("Accepted-example quotas")
+            axes[1].tick_params(axis="x", rotation=35)
             plt.tight_layout()
             plt.show()
             """
         ),
         markdown(
             """
-            ## 4. Project the SFT view
+            ## 2. Generate until the accepted quotas are full
 
-            SFT receives a conversational `(prompt, completion)` pair. The completion is the
-            tagged reference response. Raw source text and the hidden rubric are intentionally
-            absent. Paper IDs, URL, and license remain for traceability.
+            Each source is assigned to the currently most underfilled `(split, task_family)`
+            cell. Rejected drafts do not consume a quota. Concurrent calls improve throughput,
+            while all completed records are written immediately for safe resumption.
             """
         ),
         code(
             """
-            import shutil
+            canonical = generate_canonical_tasks(
+                sources,
+                accepted_path=ACCEPTED,
+                rejected_path=REJECTED,
+                split_targets=SFT_SPLIT_TARGETS,
+                task_family_weights=TASK_FAMILY_WEIGHTS,
+                teacher_model=TEACHER_MODEL,
+                critic_model=CRITIC_MODEL,
+                concurrency=GENERATION_CONCURRENCY,
+                max_attempts=MAX_GENERATION_ATTEMPTS,
+                api_max_retries=OPENAI_MAX_RETRIES,
+                api_timeout_seconds=OPENAI_TIMEOUT_SECONDS,
+            )
+            rejected = read_jsonl(REJECTED)
+            status = task_quota_status(
+                canonical,
+                SFT_SPLIT_TARGETS,
+                TASK_FAMILY_WEIGHTS,
+            )
+            if not status["complete"]:
+                raise RuntimeError(f"Unfilled quotas: {status['deficits']}")
+            print(
+                {
+                    "accepted": len(canonical),
+                    "rejected": len(rejected),
+                    "acceptance_rate": len(canonical)
+                    / max(len(canonical) + len(rejected), 1),
+                    "split_counts": pd.Series(
+                        [row["split"] for row in canonical]
+                    ).value_counts().to_dict(),
+                }
+            )
+            """
+        ),
+        code(
+            """
+            example = canonical[0]
+            display(Markdown("### Student-visible task"))
+            display(Markdown(example["task"]))
+            display(Markdown("### Reference structured work product"))
+            display(
+                JSON(
+                    {
+                        "brainstorm": example["brainstorm"],
+                        "principles": example["principles"],
+                        "synthesis": example["synthesis"],
+                        "answer": example["answer"],
+                    }
+                )
+            )
+            display(Markdown("### Hidden task-specific rubric"))
+            display(
+                JSON(
+                    {
+                        "required_constraints": example["required_constraints"],
+                        "evaluation_criteria": example["evaluation_criteria"],
+                        "acceptable_alternatives": example["acceptable_alternatives"],
+                        "failure_modes": example["failure_modes"],
+                    }
+                )
+            )
+            """
+        ),
+        markdown(
+            """
+            ## 3. Audit the curriculum
 
+            The audit checks family balance and whether the reference work products contain
+            multiple candidates and explicit principles. It does not assume that longer
+            answers are better.
+            """
+        ),
+        code(
+            """
+            audit = pd.DataFrame(
+                [
+                    {
+                        "split": row["split"],
+                        "task_family": row["task_family"],
+                        "task_chars": len(row["task"]),
+                        "brainstorm_ideas": len(row["brainstorm"]),
+                        "principles": len(row["principles"]),
+                    }
+                    for row in canonical
+                ]
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+            sns.countplot(
+                audit,
+                x="task_family",
+                hue="split",
+                ax=axes[0],
+            )
+            axes[0].tick_params(axis="x", rotation=35)
+            axes[0].set_title("Accepted task-family balance")
+            sns.scatterplot(
+                audit,
+                x="brainstorm_ideas",
+                y="principles",
+                hue="task_family",
+                alpha=0.75,
+                ax=axes[1],
+            )
+            axes[1].set_title("Structured reference depth")
+            plt.tight_layout()
+            plt.show()
+            """
+        ),
+        markdown(
+            """
+            ## 4. Build and publish the SFT projection
+
+            SFT receives `prompt + completion`. Raw source text, critic metadata, and the
+            hidden grading rubric are excluded from this projection.
+            """
+        ),
+        code(
+            """
             sft = build_sft_dataset(canonical)
-            if len(sft["train"]) == 0 or len(sft["validation"]) == 0:
+            expected_splits = {
+                "train": SFT_SPLIT_TARGETS["sft_train"],
+                "validation": SFT_SPLIT_TARGETS["sft_validation"],
+            }
+            actual_splits = {name: len(split) for name, split in sft.items()}
+            if actual_splits != expected_splits:
                 raise RuntimeError(
-                    "The paper-level split produced an empty SFT partition. Increase "
-                    "MAX_SOURCE_PAPERS, then rerun generation."
+                    f"Unexpected SFT split sizes: {actual_splits}; expected {expected_splits}"
                 )
             if SFT_DISK.exists():
                 shutil.rmtree(SFT_DISK)
             sft.save_to_disk(SFT_DISK)
             for split_name, split_data in sft.items():
-                split_data.to_parquet(DATA / "processed" / f"sft_{split_name}.parquet")
+                split_data.to_parquet(
+                    DATA / "processed" / f"scientific_design_sft_{split_name}.parquet"
+                )
             if PUSH_DATASETS_TO_HUB:
                 sft.push_to_hub(
                     DATASET_HF_REPO,
-                    config_name="sft",
+                    config_name=DATASET_CONFIG_NAME,
                     private=DATASET_PRIVATE,
                     token=HF_TOKEN,
-                    commit_message="Publish mechanism SFT splits",
+                    commit_message="Publish scientific design SFT dataset",
                 )
 
             assert "source_text" not in sft["train"].column_names
-            assert "mechanism_steps" not in sft["train"].column_names
+            assert "required_constraints" not in sft["train"].column_names
             print(sft)
             display(JSON(sft["train"][0]))
             """
@@ -373,17 +430,9 @@ nb1 = notebook(
             """
             ## Result
 
-            You now have:
-
-            - an auditable canonical dataset with source provenance and hidden causal rubrics;
-            - an explicit rejection log;
-            - an SFT dataset whose model input is only a self-contained mechanism task.
-
-            The processed SFT splits are also published under the `sft` configuration of
-            `lamm-mit/scientific-sft-grpo-data`. The private canonical source-text audit file
-            remains local and is never uploaded.
-
-            Continue with **02_build_mechanism_grpo_dataset.ipynb**.
+            The SFT dataset contains 500 training and 75 validation tasks by default, balanced
+            across five scientific problem-solving families. Continue with notebook 02, which
+            generates a separate, paper-disjoint GRPO curriculum and its hidden rubrics.
             """
         ),
     ]
@@ -394,27 +443,31 @@ nb2 = notebook(
     [
         markdown(
             """
-            # 02 — Build and inspect the GRPO dataset
+            # 02 — Generate the scientific problem-solving GRPO dataset
 
-            SFT teaches the desired response pattern. GRPO then samples several answers to the
-            same task and increases the probability of answers that receive higher reward.
+            This notebook builds a separate task bank for GRPO. It excludes every paper used
+            for SFT, generates task-only prompts plus hidden task-specific rubrics, and
+            demonstrates the exact reward:
 
-            The student-facing prompt is still only a self-contained mechanism task. Hidden
-            reference fields are passed to reward functions, not appended to the prompt.
+            \\[
+            R = F\\times(0.10 + 0.90J)
+            \\]
+
+            `F` is an exact four-section format gate. `J` is the average of four integer
+            0–4 scores from `gpt-5.6-luna`: brainstorm, principles, synthesis, and answer.
             """
         ),
         markdown(
             """
             ## Configuration
 
-            The OpenAI key is read from `OPENAI_API_KEY`. All other settings are explicit
-            notebook variables. Hugging Face uses your cached `hf auth login` credentials
-            unless you deliberately uncomment the optional token line.
+            Dataset-generation and reward parameters are explicit below. `OPENAI_API_KEY`
+            remains an environment secret; Hugging Face uses cached login unless the optional
+            token line is uncommented.
             """
         ),
         code(
             """
-            import os
             import shutil
             from pathlib import Path
 
@@ -424,89 +477,234 @@ nb2 = notebook(
             from IPython.display import JSON, Markdown, display
 
             from science_course.data import (
+                TASK_FAMILIES,
                 build_grpo_dataset,
                 read_jsonl,
                 render_completion,
+                stream_open_science_sources,
+                task_quota_status,
+                write_jsonl,
             )
             from science_course.hub import require_hf_namespace
-            from science_course.judge import MechanismJudge
-            from science_course.rewards import component_scores
-            from science_course.teacher import DEFAULT_TEACHER_MODEL, require_openai_key
+            from science_course.judge import (
+                DEFAULT_JUDGE_MODEL,
+                ScientificDesignJudge,
+            )
+            from science_course.rewards import (
+                combined_reward,
+                format_reward,
+                semantic_score_from_judgment,
+            )
+            from science_course.teacher import (
+                DEFAULT_CRITIC_MODEL,
+                DEFAULT_TEACHER_MODEL,
+                generate_canonical_tasks,
+                require_openai_key,
+            )
 
             ROOT = Path.cwd().resolve()
             if ROOT.name == "notebooks":
                 ROOT = ROOT.parent
             DATA = ROOT / "data"
-            CANONICAL = DATA / "canonical" / "mechanism_tasks.jsonl"
-            GRPO_DISK = DATA / "processed" / "grpo"
-            JUDGE_CACHE = ROOT / "results" / "grpo_judge_cache.jsonl"
 
-            JUDGE_MODEL = DEFAULT_TEACHER_MODEL
+            # Local artifacts
+            SFT_CANONICAL = DATA / "canonical" / "scientific_design_sft_tasks.jsonl"
+            RAW_SOURCES = DATA / "raw" / "scientific_design_grpo_sources.jsonl"
+            ACCEPTED = DATA / "canonical" / "scientific_design_grpo_tasks.jsonl"
+            REJECTED = DATA / "canonical" / "scientific_design_grpo_rejected.jsonl"
+            GRPO_DISK = DATA / "processed" / "scientific_design_grpo"
+            JUDGE_CACHE = ROOT / "results" / "scientific_design_judge_cache.jsonl"
+
+            # Teacher, critic, and GRPO judge
+            TEACHER_MODEL = DEFAULT_TEACHER_MODEL
+            CRITIC_MODEL = DEFAULT_CRITIC_MODEL
+            JUDGE_MODEL = DEFAULT_JUDGE_MODEL
+
+            # Exact accepted-example targets
+            GRPO_SPLIT_TARGETS = {
+                "grpo_train": 500,
+                "grpo_validation": 75,
+                "test": 100,
+            }
+            TASK_FAMILY_WEIGHTS = {
+                "mechanism_guided_design": 0.25,
+                "experimental_design": 0.25,
+                "troubleshooting": 0.20,
+                "hypothesis_development": 0.15,
+                "cross_domain_synthesis": 0.15,
+            }
+
+            # Open scientific source pool
+            SOURCE_DATASET_ID = "common-pile/peS2o"
+            SOURCE_SPLIT = "train"
+            SOURCE_CANDIDATE_LIMIT = 3_000
+            MAX_SOURCE_RECORDS_SCANNED = 250_000
+            MIN_SOURCE_CHARS = 1_200
+            MAX_SOURCE_CHARS = 6_000
+            RANDOM_SEED = 29
+
+            # Resumable API generation
+            GENERATION_CONCURRENCY = 8
+            MAX_GENERATION_ATTEMPTS = 3_000
+            OPENAI_MAX_RETRIES = 3
+            OPENAI_TIMEOUT_SECONDS = 120.0
+
+            # Exact GRPO reward coefficients
+            FORMAT_BASE_REWARD = 0.10
+            SEMANTIC_REWARD_WEIGHT = 0.90
+            JUDGE_DIMENSION_MAX_SCORE = 4
+
+            # Hugging Face publication
             DATASET_HF_REPO = "lamm-mit/scientific-sft-grpo-data"
+            DATASET_CONFIG_NAME = "scientific_design_grpo"
             PUSH_DATASETS_TO_HUB = True
             DATASET_PRIVATE = False
             HF_TOKEN = None
-            # HF_TOKEN = os.environ["HF_TOKEN"]  # Optional; prefer `hf auth login`.
+            # HF_TOKEN = __import__("os").environ["HF_TOKEN"]  # Optional; prefer `hf auth login`.
 
             require_openai_key()
-            assert JUDGE_MODEL == "gpt-5.6-terra", (
-                "This class notebook is tested with the requested judge model: "
-                "gpt-5.6-terra"
-            )
+            if set(TASK_FAMILY_WEIGHTS) != set(TASK_FAMILIES):
+                raise ValueError(f"Define weights for exactly these families: {TASK_FAMILIES}")
+            if abs(FORMAT_BASE_REWARD + SEMANTIC_REWARD_WEIGHT - 1.0) > 1e-9:
+                raise ValueError("The reward coefficients must sum to one.")
+            if JUDGE_DIMENSION_MAX_SCORE != 4:
+                raise ValueError("The tested Luna rubric uses integer scores from 0 to 4.")
             if PUSH_DATASETS_TO_HUB:
                 require_hf_namespace(DATASET_HF_REPO, token=HF_TOKEN)
-            canonical = read_jsonl(CANONICAL)
-            if not canonical:
+
+            sft_canonical = read_jsonl(SFT_CANONICAL)
+            if not sft_canonical:
                 raise RuntimeError("Run notebook 01 first.")
+            sft_paper_ids = {row["paper_id"] for row in sft_canonical}
             sns.set_theme(style="whitegrid", context="talk")
-            print(
-                {
-                    "canonical_tasks": len(canonical),
-                    "judge_model": JUDGE_MODEL,
-                    "dataset_hub_repo": DATASET_HF_REPO,
-                }
+            display(
+                JSON(
+                    {
+                        "teacher_model": TEACHER_MODEL,
+                        "critic_model": CRITIC_MODEL,
+                        "judge_model": JUDGE_MODEL,
+                        "accepted_targets": GRPO_SPLIT_TARGETS,
+                        "excluded_sft_papers": len(sft_paper_ids),
+                        "reward_formula": "F * (0.10 + 0.90 * J)",
+                    }
+                )
             )
             """
         ),
         markdown(
             """
-            ## 1. Make the GRPO projection
+            ## 1. Acquire a paper-disjoint source pool
 
-            Each row contains:
+            Every paper used by SFT is excluded before GRPO task generation. This makes the
+            two adaptation stages and final test set traceable to disjoint source documents.
+            """
+        ),
+        code(
+            """
+            cached_sources = read_jsonl(RAW_SOURCES)
+            cache_is_usable = (
+                len(cached_sources) == SOURCE_CANDIDATE_LIMIT
+                and not ({row["paper_id"] for row in cached_sources} & sft_paper_ids)
+                and all(
+                    row.get("source_dataset") == SOURCE_DATASET_ID
+                    and row.get("source_split") == SOURCE_SPLIT
+                    for row in cached_sources
+                )
+            )
+            if cache_is_usable:
+                sources = cached_sources
+                print(f"Reusing {len(sources)} cached GRPO sources")
+            else:
+                sources = stream_open_science_sources(
+                    dataset_id=SOURCE_DATASET_ID,
+                    split=SOURCE_SPLIT,
+                    max_papers=SOURCE_CANDIDATE_LIMIT,
+                    max_scanned=MAX_SOURCE_RECORDS_SCANNED,
+                    min_chars=MIN_SOURCE_CHARS,
+                    max_chars=MAX_SOURCE_CHARS,
+                    seed=RANDOM_SEED,
+                    exclude_paper_ids=sft_paper_ids,
+                )
+                write_jsonl(RAW_SOURCES, sources)
+                print(f"Cached {len(sources)} paper-disjoint source candidates")
+            if {row["paper_id"] for row in sources} & sft_paper_ids:
+                raise RuntimeError("SFT/GRPO source-paper leakage detected.")
+            """
+        ),
+        markdown(
+            """
+            ## 2. Generate GRPO tasks and hidden rubrics
 
-            - `prompt`: the only input to the policy;
-            - `task`: used to verify that quoted evidence actually appears in the task;
-            - `mechanism_steps` and `causal_links`: a hidden semantic rubric;
-            - reference reasoning/answer: guidance for the judge, not a phrase-match target;
-            - provenance fields.
+            GRPO references are retained only in the local canonical audit. The policy-facing
+            projection contains the task and a hidden rubric for reward calculation—never a
+            gold completion.
+            """
+        ),
+        code(
+            """
+            canonical = generate_canonical_tasks(
+                sources,
+                accepted_path=ACCEPTED,
+                rejected_path=REJECTED,
+                split_targets=GRPO_SPLIT_TARGETS,
+                task_family_weights=TASK_FAMILY_WEIGHTS,
+                teacher_model=TEACHER_MODEL,
+                critic_model=CRITIC_MODEL,
+                concurrency=GENERATION_CONCURRENCY,
+                max_attempts=MAX_GENERATION_ATTEMPTS,
+                api_max_retries=OPENAI_MAX_RETRIES,
+                api_timeout_seconds=OPENAI_TIMEOUT_SECONDS,
+            )
+            status = task_quota_status(
+                canonical,
+                GRPO_SPLIT_TARGETS,
+                TASK_FAMILY_WEIGHTS,
+            )
+            if not status["complete"]:
+                raise RuntimeError(f"Unfilled GRPO quotas: {status['deficits']}")
+            print(
+                {
+                    "accepted": len(canonical),
+                    "rejected": len(read_jsonl(REJECTED)),
+                    "split_counts": pd.Series(
+                        [row["split"] for row in canonical]
+                    ).value_counts().to_dict(),
+                }
+            )
             """
         ),
         code(
             """
             grpo = build_grpo_dataset(canonical)
-            if len(grpo["train"]) == 0 or len(grpo["validation"]) == 0:
+            expected_splits = {
+                "train": GRPO_SPLIT_TARGETS["grpo_train"],
+                "validation": GRPO_SPLIT_TARGETS["grpo_validation"],
+                "test": GRPO_SPLIT_TARGETS["test"],
+            }
+            actual_splits = {name: len(split) for name, split in grpo.items()}
+            if actual_splits != expected_splits:
                 raise RuntimeError(
-                    "The paper-level split produced an empty GRPO partition. Increase "
-                    "MAX_SOURCE_PAPERS in notebook 01, then rerun generation."
+                    f"Unexpected GRPO split sizes: {actual_splits}; expected {expected_splits}"
                 )
             if GRPO_DISK.exists():
                 shutil.rmtree(GRPO_DISK)
             grpo.save_to_disk(GRPO_DISK)
             for split_name, split_data in grpo.items():
-                split_data.to_parquet(DATA / "processed" / f"grpo_{split_name}.parquet")
+                split_data.to_parquet(
+                    DATA / "processed" / f"scientific_design_grpo_{split_name}.parquet"
+                )
             if PUSH_DATASETS_TO_HUB:
                 grpo.push_to_hub(
                     DATASET_HF_REPO,
-                    config_name="grpo",
+                    config_name=DATASET_CONFIG_NAME,
                     private=DATASET_PRIVATE,
                     token=HF_TOKEN,
-                    commit_message="Publish mechanism GRPO splits",
+                    commit_message="Publish scientific design GRPO dataset",
                 )
-
             for split_data in grpo.values():
                 assert "source_text" not in split_data.column_names
                 assert "completion" not in split_data.column_names
-
+                assert "answer" not in split_data.column_names
             print(grpo)
             """
         ),
@@ -515,17 +713,17 @@ nb2 = notebook(
             row = grpo["train"][0]
             display(Markdown("### What the policy sees"))
             display(JSON(row["prompt"]))
-            display(Markdown("### What reward functions can see"))
+            display(Markdown("### What the reward can see"))
             display(
                 JSON(
                     {
                         key: row[key]
                         for key in (
                             "task",
-                            "mechanism_steps",
-                            "causal_links",
-                            "required_concepts",
-                            "reference_answer",
+                            "required_constraints",
+                            "evaluation_criteria",
+                            "acceptable_alternatives",
+                            "failure_modes",
                         )
                     }
                 )
@@ -534,66 +732,60 @@ nb2 = notebook(
         ),
         markdown(
             """
-            ## 2. Reward design: mechanics plus semantics
+            ## 3. Demonstrate the exact reward
 
-            Four complementary signals are used:
-
-            1. **Structure** — the three required response tags are present.
-            2. **Evidence grounding** — the quoted evidence occurs in the task.
-            3. **Concept coverage** — expected concepts appear somewhere in the explanation.
-            4. **Mechanism judge** — `gpt-5.6-terra` evaluates causal correctness,
-               completeness, and whether evidence supports the stated mechanism.
-
-            The semantic judge receives a whole trainer batch in one structured-output API
-            request. Judgments are cached by content hash, including model and prompt version.
-            A keyword check cannot tell causal direction; the judge carries most of the reward.
+            A malformed response gets `F=0` and therefore total reward zero without an API
+            call. A valid response gets the 0.10 format base plus 0.90 times Luna's semantic
+            score. Luna grades all four dimensions from 0 to 4 and accepts valid alternatives.
             """
         ),
         code(
             """
-            reference_completion = render_completion(
-                {
-                    "reasoning": row["reference_reasoning"],
-                    "evidence": row["reference_evidence"],
-                    "answer": row["reference_answer"],
-                }
-            )
-            deterministic = component_scores(
-                reference_completion,
-                task=row["task"],
-                reference_answer=row["reference_answer"],
-                required_concepts=row["required_concepts"],
-            )
-            display(JSON(deterministic))
-            """
-        ),
-        code(
-            """
-            judge = MechanismJudge(
+            canonical_by_id = {item["task_id"]: item for item in canonical}
+            reference_record = canonical_by_id[row["task_id"]]
+            reference_completion = render_completion(reference_record)
+            format_score = format_reward([reference_completion])[0]
+
+            judge_item = {
+                "task": row["task"],
+                "required_constraints": row["required_constraints"],
+                "evaluation_criteria": row["evaluation_criteria"],
+                "acceptable_alternatives": row["acceptable_alternatives"],
+                "failure_modes": row["failure_modes"],
+                "student_response": reference_completion,
+            }
+            judge = ScientificDesignJudge(
                 model=JUDGE_MODEL,
                 cache_path=JUDGE_CACHE,
+                api_max_retries=OPENAI_MAX_RETRIES,
+                api_timeout_seconds=OPENAI_TIMEOUT_SECONDS,
             )
-            semantic_score = judge.score(
-                [
+            judgment = judge.judgments([judge_item])[0]
+            semantic_score = semantic_score_from_judgment(judgment)
+            total_reward = combined_reward(
+                format_score,
+                semantic_score,
+                format_base_reward=FORMAT_BASE_REWARD,
+                semantic_reward_weight=SEMANTIC_REWARD_WEIGHT,
+            )
+            display(
+                JSON(
                     {
-                        "task": row["task"],
-                        "reference_reasoning": row["reference_reasoning"],
-                        "reference_answer": row["reference_answer"],
-                        "mechanism_steps": row["mechanism_steps"],
-                        "causal_links": row["causal_links"],
-                        "student_response": reference_completion,
+                        "format_score_F": format_score,
+                        "luna_judgment": judgment,
+                        "semantic_score_J": semantic_score,
+                        "total_reward_R": total_reward,
                     }
-                ]
-            )[0]
-            print({"cached_semantic_mechanism_score": semantic_score})
+                )
+            )
             """
         ),
         markdown(
             """
-            ## 3. Inspect the mechanism curriculum
+            ## 4. Audit the GRPO curriculum
 
-            The purpose of this audit is diversity of causal structure, not numerical label
-            balance. We inspect task length, number of causal links, and concept vocabulary.
+            The following plots verify family balance, task sizes, and rubric depth. The
+            final test split remains untouched by either SFT or GRPO updates.
             """
         ),
         code(
@@ -602,51 +794,33 @@ nb2 = notebook(
                 [
                     {
                         "split": split_name,
+                        "task_family": item["task_family"],
                         "task_chars": len(item["task"]),
-                        "causal_links": len(item["causal_links"]),
-                        "mechanism_steps": len(item["mechanism_steps"]),
+                        "constraints": len(item["required_constraints"]),
+                        "criteria": len(item["evaluation_criteria"]),
                     }
                     for split_name, split_data in grpo.items()
                     for item in split_data
                 ]
             )
-            fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-            sns.boxplot(frame, x="split", y="task_chars", ax=axes[0], color="#87a9cc")
-            axes[0].tick_params(axis="x", rotation=25)
-            axes[0].set_title("Self-contained task size")
+            fig, axes = plt.subplots(1, 2, figsize=(15, 5))
             sns.countplot(
                 frame,
-                x="causal_links",
+                x="task_family",
                 hue="split",
+                ax=axes[0],
+            )
+            axes[0].tick_params(axis="x", rotation=35)
+            axes[0].set_title("GRPO task-family balance")
+            sns.scatterplot(
+                frame,
+                x="constraints",
+                y="criteria",
+                hue="task_family",
+                alpha=0.7,
                 ax=axes[1],
-                palette="deep",
             )
-            axes[1].set_title("Explicit causal links")
-            plt.tight_layout()
-            plt.show()
-            """
-        ),
-        code(
-            """
-            concept_counts = (
-                pd.Series(
-                    [
-                        concept.casefold()
-                        for split_data in grpo.values()
-                        for item in split_data
-                        for concept in item["required_concepts"]
-                    ]
-                )
-                .value_counts()
-                .head(20)
-                .sort_values()
-            )
-            concept_counts.plot.barh(
-                figsize=(9, 7),
-                color="#d97732",
-                title="Frequent rubric concepts",
-            )
-            plt.xlabel("tasks")
+            axes[1].set_title("Hidden rubric depth")
             plt.tight_layout()
             plt.show()
             """
@@ -655,10 +829,9 @@ nb2 = notebook(
             """
             ## Result
 
-            The GRPO policy will receive no answer and no source document—only a
-            self-contained mechanism task. The hidden causal rubric supports semantic reward.
-
-            Continue with **03_finetune_sft_lora.ipynb**.
+            The default GRPO dataset contains 500 training, 75 validation, and 100 final-test
+            tasks. Notebook 03 trains the four-section SFT policy; notebook 04 then uses the
+            single combined Luna reward demonstrated above.
             """
         ),
     ]
@@ -669,49 +842,24 @@ nb3 = notebook(
     [
         markdown(
             """
-            # 03 — LoRA supervised fine-tuning (SFT)
+            # 03 — LoRA supervised fine-tuning
 
-            We adapt the instruction-tuned Gemma 4 text decoder with LoRA. The base weights
-            remain frozen; small low-rank adapters learn to produce:
-
-            ```
-            <reasoning>causal chain</reasoning>
-            <evidence>observation quoted from the task</evidence>
-            <answer>mechanistic conclusion</answer>
-            ```
-
-            Device selection is automatic: **CUDA → MPS → CPU**. Gemma 4 E4B is a serious
-            model; MPS and CPU paths are functional fallbacks but may be impractically slow
-            on a laptop. Set `MODEL_ID` to a smaller chat model for an in-class laptop run.
-            """
-        ),
-        markdown(
-            """
-            ## Prerequisites
-
-            Run notebooks 01–02 first. Accept the Gemma license on Hugging Face and authenticate:
-
-            ```bash
-            hf auth login
-            ```
-
-            Every model, LoRA, training, checkpoint, and Hub setting is defined in the
-            configuration cell below.
+            Completion-only SFT teaches Gemma 4 to turn a task-only prompt into the four
+            scientific work-product sections. The base weights remain frozen and only LoRA
+            parameters are optimized. Device selection is automatic: **CUDA → MPS → CPU**.
             """
         ),
         markdown(
             """
             ## Configuration
 
-            Change values here—do not create additional environment variables. Hugging Face
-            uses cached login credentials. The optional `HF_TOKEN` line may be uncommented
-            after exporting a token, but never paste a token into the notebook.
+            All model, LoRA, training, checkpoint, generation, and Hub settings used below
+            are explicit variables. Hugging Face uses cached authentication by default.
             """
         ),
         code(
             """
             import os
-
             from pathlib import Path
 
             import matplotlib.pyplot as plt
@@ -736,13 +884,15 @@ nb3 = notebook(
             if ROOT.name == "notebooks":
                 ROOT = ROOT.parent
 
-            # Runtime and artifact locations
+            # Runtime and local artifacts
             ENABLE_MPS_FALLBACK = True
+            TOKENIZERS_PARALLELISM = False
             if ENABLE_MPS_FALLBACK:
                 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            os.environ["TOKENIZERS_PARALLELISM"] = str(TOKENIZERS_PARALLELISM).lower()
             MODEL_ID = "google/gemma-4-E4B-it"
-            SFT_DATA = ROOT / "data" / "processed" / "sft"
-            OUTPUT_DIR = ROOT / "artifacts" / "gemma4-mechanism-sft"
+            SFT_DATA = ROOT / "data" / "processed" / "scientific_design_sft"
+            OUTPUT_DIR = ROOT / "artifacts" / "gemma4-scientific-design-sft"
             RESUME_FROM_CHECKPOINT = None
 
             # LoRA
@@ -751,40 +901,64 @@ nb3 = notebook(
             LORA_DROPOUT = 0.05
             LORA_TARGET_MODULES = "all-linear"
 
-            # SFT
+            # SFT optimization
             NUM_TRAIN_EPOCHS = 3
             MAX_STEPS = -1
             LEARNING_RATE = 1e-4
             TRAIN_BATCH_SIZE = 1
             EVAL_BATCH_SIZE = 1
             GRADIENT_ACCUMULATION_STEPS = 8
-            MAX_SEQUENCE_LENGTH = 1_024
-            WARMUP_RATIO = 0.05
+            MAX_SEQUENCE_LENGTH = 1_536
+            COMPLETION_ONLY_LOSS = True
+            LOSS_TYPE = "nll"
+            GRADIENT_CHECKPOINTING = True
+            GRADIENT_CHECKPOINTING_USE_REENTRANT = False
+            OPTIMIZER = "adamw_torch"
+            WARMUP_STEPS = 10
+            EVAL_STRATEGY = "steps"
             EVAL_STEPS = 25
+            SAVE_STRATEGY = "steps"
             SAVE_STEPS = 25
+            SAVE_TOTAL_LIMIT = None
             LOGGING_STEPS = 5
+            LOGGING_FIRST_STEP = True
+            REPORT_TO = "none"
             RANDOM_SEED = 17
+            PIN_MEMORY_ON_CUDA_ONLY = True
 
-            # Hugging Face publication: every saved checkpoint plus the final adapter
+            # Inference demonstration
+            MAX_NEW_TOKENS = 512
+            INFERENCE_DO_SAMPLE = False
+            INFERENCE_TEMPERATURE = 1.0
+            INFERENCE_TOP_P = 1.0
+
+            # Hugging Face publication
             DATASET_HF_REPO = "lamm-mit/scientific-sft-grpo-data"
-            SFT_HF_REPO = "lamm-mit/scientific-sft-grpo-sft"
+            DATASET_CONFIG_NAME = "scientific_design_sft"
+            SFT_HF_REPO = "lamm-mit/scientific-sft-grpo-design-sft"
             PUSH_TO_HUB = True
+            HUB_STRATEGY = "all_checkpoints"
             HUB_PRIVATE_REPO = False
+            HUB_ALWAYS_PUSH = True
             HF_TOKEN = None
             # HF_TOKEN = os.environ["HF_TOKEN"]  # Optional; prefer `hf auth login`.
 
             versions = require_training_stack()
             runtime = detect_runtime()
+            DATALOADER_PIN_MEMORY = (
+                runtime.backend == "cuda" if PIN_MEMORY_ON_CUDA_ONLY else True
+            )
             if PUSH_TO_HUB:
                 require_hf_namespace(SFT_HF_REPO, token=HF_TOKEN)
-
             display(
                 JSON(
                     {
                         "runtime": runtime.as_dict(),
                         "versions": versions,
                         "model": MODEL_ID,
-                        "hub_repo": SFT_HF_REPO,
+                        "local_dataset": str(SFT_DATA),
+                        "hub_dataset": f"{DATASET_HF_REPO}/{DATASET_CONFIG_NAME}",
+                        "hub_model": SFT_HF_REPO,
                     }
                 )
             )
@@ -792,11 +966,10 @@ nb3 = notebook(
         ),
         markdown(
             """
-            ## 1. Load and render the prompt-completion data
+            ## 1. Render task-only prompts and structured completions
 
-            The tokenizer's own chat template formats the prompt. We disable any model-specific
-            thinking mode when the template supports that option. SFT loss is computed on the
-            reference completion, not the prompt.
+            The tokenizer's chat template formats each prompt. Loss is computed only on the
+            assistant completion, which contains the four tagged sections.
             """
         ),
         code(
@@ -827,14 +1000,20 @@ nb3 = notebook(
             """
             lengths = pd.DataFrame(
                 {
-                    split_name: pd.Series([
-                        len(tokenizer(item["prompt"] + item["completion"]).input_ids)
-                        for item in split_data
-                    ])
+                    split_name: pd.Series(
+                        [
+                            len(
+                                tokenizer(
+                                    item["prompt"] + item["completion"]
+                                ).input_ids
+                            )
+                            for item in split_data
+                        ]
+                    )
                     for split_name, split_data in rendered.items()
                 }
             )
-            lengths.plot.hist(bins=20, alpha=0.65, figsize=(9, 4.5))
+            lengths.plot.hist(bins=25, alpha=0.65, figsize=(10, 4.5))
             plt.axvline(
                 MAX_SEQUENCE_LENGTH,
                 color="crimson",
@@ -842,7 +1021,7 @@ nb3 = notebook(
                 label="training max_length",
             )
             plt.xlabel("tokens")
-            plt.title("SFT sequence-length audit")
+            plt.title("Structured SFT sequence-length audit")
             plt.legend()
             plt.tight_layout()
             plt.show()
@@ -850,11 +1029,10 @@ nb3 = notebook(
         ),
         markdown(
             """
-            ## 2. Load Gemma and attach LoRA
+            ## 2. Attach LoRA and configure the trainer
 
-            `AutoModelForCausalLM` loads only the text decoder. We do not quantize because the
-            same notebook must work on CUDA, Apple MPS, and CPU. LoRA targets linear layers;
-            only adapter parameters are optimized.
+            No CUDA-only quantization dependency is used, so the same path works on CUDA,
+            Apple MPS, and CPU.
             """
         ),
         code(
@@ -877,32 +1055,34 @@ nb3 = notebook(
                 per_device_eval_batch_size=EVAL_BATCH_SIZE,
                 gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
                 max_length=MAX_SEQUENCE_LENGTH,
-                completion_only_loss=True,
-                loss_type="nll",
-                gradient_checkpointing=True,
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-                optim="adamw_torch",
-                warmup_ratio=WARMUP_RATIO,
-                eval_strategy="steps",
+                completion_only_loss=COMPLETION_ONLY_LOSS,
+                loss_type=LOSS_TYPE,
+                gradient_checkpointing=GRADIENT_CHECKPOINTING,
+                gradient_checkpointing_kwargs={
+                    "use_reentrant": GRADIENT_CHECKPOINTING_USE_REENTRANT
+                },
+                optim=OPTIMIZER,
+                warmup_steps=WARMUP_STEPS,
+                eval_strategy=EVAL_STRATEGY,
                 eval_steps=EVAL_STEPS,
-                save_strategy="steps",
+                save_strategy=SAVE_STRATEGY,
                 save_steps=SAVE_STEPS,
-                save_total_limit=None,
+                save_total_limit=SAVE_TOTAL_LIMIT,
                 logging_steps=LOGGING_STEPS,
-                logging_first_step=True,
-                report_to="none",
+                logging_first_step=LOGGING_FIRST_STEP,
+                report_to=REPORT_TO,
+                dataloader_pin_memory=DATALOADER_PIN_MEMORY,
                 push_to_hub=PUSH_TO_HUB,
                 hub_model_id=SFT_HF_REPO,
-                hub_strategy="all_checkpoints",
+                hub_strategy=HUB_STRATEGY,
                 hub_private_repo=HUB_PRIVATE_REPO,
                 hub_token=HF_TOKEN,
-                hub_always_push=True,
+                hub_always_push=HUB_ALWAYS_PUSH,
                 bf16=runtime.trainer_bf16,
                 fp16=runtime.trainer_fp16,
                 use_cpu=runtime.use_cpu,
                 seed=RANDOM_SEED,
             )
-
             trainer = SFTTrainer(
                 model=model,
                 args=sft_args,
@@ -916,11 +1096,10 @@ nb3 = notebook(
         ),
         markdown(
             """
-            ## 3. Train
+            ## 3. Train, evaluate, checkpoint, and publish
 
-            The progress bar reports optimization loss; periodic validation measures whether
-            held-out reference responses are also becoming more likely. Change `MAX_STEPS`
-            in the configuration cell for a bounded classroom run.
+            Every saved checkpoint and the final adapter are uploaded when publication is
+            enabled.
             """
         ),
         code(
@@ -932,7 +1111,7 @@ nb3 = notebook(
             tokenizer.save_pretrained(OUTPUT_DIR)
             if PUSH_TO_HUB:
                 hub_result = trainer.push_to_hub(
-                    commit_message="Complete mechanism SFT training"
+                    commit_message="Complete scientific design SFT training"
                 )
                 print(f"Published final adapter and all checkpoints: {hub_result}")
             display(JSON(train_result.metrics))
@@ -949,7 +1128,11 @@ nb3 = notebook(
             axes[0].set_title("Completion-only SFT loss")
             if "eval_loss" in history:
                 history.dropna(subset=["eval_loss"]).plot(
-                    x="step", y="eval_loss", ax=axes[1], color="#d97732", legend=False
+                    x="step",
+                    y="eval_loss",
+                    ax=axes[1],
+                    color="#d97732",
+                    legend=False,
                 )
             axes[1].set_title("Held-out SFT loss")
             plt.tight_layout()
@@ -960,38 +1143,47 @@ nb3 = notebook(
             """
             ## 4. Use the adapter on a new task
 
-            This is the real deployment interface: give the fine-tuned model a new
-            self-contained mechanism task. No original paper text or reference answer is
-            required at inference time.
+            Inference needs only a new task. It does not require a paper, reference completion,
+            hidden rubric, or teacher API call.
             """
         ),
         code(
             """
             new_task = (
-                "A hydrogel contains polymer chains joined by reversible host–guest "
-                "interactions. Mechanical strain separates some pairs, allowing local chain "
-                "rearrangement. After the strain is removed, compatible host and guest groups "
-                "associate again. Explain how these events allow the gel to recover after damage."
+                "Design a self-healing hydrogel for repeated deformation in water. "
+                "The material may use reversible physical interactions, but recovery must "
+                "not require external heating. Develop several mechanistic strategies, "
+                "identify the governing design principles, synthesize the strongest design, "
+                "and give a final recommendation."
             )
             new_messages = [
                 {
                     "role": "system",
                     "content": (
-                        "Solve the self-contained scientific mechanism task. Explain the causal "
-                        "chain, quote the most relevant observation already included in the task, "
-                        "and give a concise answer."
+                        "Solve the self-contained scientific problem-solving task. Develop "
+                        "candidate ideas, identify principles, synthesize them, and answer."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"SCIENTIFIC MECHANISM TASK\\n{new_task}\\n\\n"
-                        "Respond with <reasoning>, <evidence>, and <answer> tags."
+                        f"SCIENTIFIC PROBLEM-SOLVING TASK\\n{new_task}\\n\\n"
+                        "Respond with <brainstorm>, <principles>, <synthesis>, and "
+                        "<answer> in that order, with no text outside the tags."
                     ),
                 },
             ]
             prompt = render_prompt(tokenizer, new_messages)
-            response = generate_text(trainer.model, tokenizer, prompt, runtime)
+            response = generate_text(
+                trainer.model,
+                tokenizer,
+                prompt,
+                runtime,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=INFERENCE_DO_SAMPLE,
+                temperature=INFERENCE_TEMPERATURE,
+                top_p=INFERENCE_TOP_P,
+            )
             display(Markdown(f"```text\\n{response}\\n```"))
             """
         ),
@@ -999,11 +1191,9 @@ nb3 = notebook(
             """
             ## Result
 
-            `artifacts/gemma4-mechanism-sft/` contains a small LoRA adapter plus tokenizer
-            metadata—not a second copy of all Gemma weights. The final adapter and every saved
-            checkpoint are also published to `lamm-mit/scientific-sft-grpo-sft`. Notebook 04
-            loads that adapter as the starting policy and improves it with mechanism-sensitive
-            GRPO rewards.
+            The local adapter is in `artifacts/gemma4-scientific-design-sft/`, and the final
+            adapter plus every saved checkpoint are published to the configured Hub model
+            repository. Notebook 04 continues this same adapter with Luna-judged GRPO.
             """
         ),
     ]
@@ -1014,46 +1204,41 @@ nb4 = notebook(
     [
         markdown(
             """
-            # 04 — Continue the LoRA adapter with GRPO
+            # 04 — Continue the SFT adapter with GRPO
 
-            GRPO samples a group of candidate explanations for each self-contained task,
-            scores them, and reinforces answers that are better **relative to the group**.
+            For each task, GRPO samples four structured completions, scores them, and reinforces
+            completions that are better relative to the group. The reward stays intentionally
+            simple:
 
-            ```
-                                  ┌─ candidate A ─ rewards ─┐
-            mechanism task ──────┼─ candidate B ─ rewards ─┼─ relative advantages ─ LoRA update
-                                  ├─ candidate C ─ rewards ─┤
-                                  └─ candidate D ─ rewards ─┘
-            ```
+            \\[
+            R = F\\times(0.10 + 0.90J)
+            \\]
 
-            This notebook continues the SFT LoRA adapter. It does not restart from the base
-            model, and it never trains against numerical target values.
+            `F` is the exact format gate. `J` is `gpt-5.6-luna`'s normalized four-dimension
+            scientific judgment.
             """
         ),
         markdown(
             """
             ## Important execution note
 
-            The semantic reward calls `gpt-5.6-terra`. Use a single training process in this
-            teaching notebook; the batched judge cache is intentionally simple and auditable.
-            Each unique completion is paid API work, so begin with a short run and inspect the
-            logged rewards before increasing `MAX_STEPS` in the configuration cell.
+            The semantic reward is live API work because the policy creates new completions
+            during training. The cache makes reruns resumable. This notebook intentionally
+            requires one training process; a distributed production run should use a
+            concurrency-safe reward service.
             """
         ),
         markdown(
             """
             ## Configuration
 
-            All models, rewards, training hyperparameters, paths, and Hub repositories are
-            explicit here. `OPENAI_API_KEY` remains an environment secret. Hugging Face uses
-            `hf auth login`; the optional token line may be uncommented but never populated
-            with a literal token inside the notebook.
+            Every model, reward coefficient, sampling setting, optimizer parameter, checkpoint
+            setting, path, and Hub repository used below is an explicit variable.
             """
         ),
         code(
             """
             import os
-
             from pathlib import Path
 
             import matplotlib.pyplot as plt
@@ -1067,8 +1252,9 @@ nb4 = notebook(
             from science_course.devices import clear_device_cache, detect_runtime
             from science_course.hub import require_hf_namespace
             from science_course.judge import (
-                configure_mechanism_judge,
-                mechanism_judge_reward,
+                DEFAULT_JUDGE_MODEL,
+                configure_scientific_design_judge,
+                scientific_design_reward,
             )
             from science_course.modeling import (
                 generate_text,
@@ -1076,75 +1262,113 @@ nb4 = notebook(
                 load_tokenizer,
                 render_prompt,
             )
-            from science_course.rewards import (
-                concept_coverage_reward,
-                evidence_grounding_reward,
-                format_reward,
-            )
-            from science_course.teacher import DEFAULT_TEACHER_MODEL, require_openai_key
+            from science_course.teacher import require_openai_key
             from science_course.versions import require_training_stack
 
             ROOT = Path.cwd().resolve()
             if ROOT.name == "notebooks":
                 ROOT = ROOT.parent
 
-            # Runtime and artifacts
+            # Runtime and local artifacts
             ENABLE_MPS_FALLBACK = True
+            TOKENIZERS_PARALLELISM = False
             if ENABLE_MPS_FALLBACK:
                 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            os.environ["TOKENIZERS_PARALLELISM"] = str(TOKENIZERS_PARALLELISM).lower()
             MODEL_ID = "google/gemma-4-E4B-it"
-            SFT_ADAPTER_SOURCE = ROOT / "artifacts" / "gemma4-mechanism-sft"
-            GRPO_ADAPTER = ROOT / "artifacts" / "gemma4-mechanism-grpo"
-            GRPO_DATA = ROOT / "data" / "processed" / "grpo"
+            SFT_ADAPTER_SOURCE = ROOT / "artifacts" / "gemma4-scientific-design-sft"
+            GRPO_ADAPTER = ROOT / "artifacts" / "gemma4-scientific-design-grpo"
+            GRPO_DATA = ROOT / "data" / "processed" / "scientific_design_grpo"
             RESUME_FROM_CHECKPOINT = None
 
-            # Semantic judge
-            JUDGE_MODEL = DEFAULT_TEACHER_MODEL
-            JUDGE_CACHE = ROOT / "results" / "grpo_judge_cache.jsonl"
+            # Exact Luna reward
+            JUDGE_MODEL = DEFAULT_JUDGE_MODEL
+            JUDGE_CACHE = ROOT / "results" / "scientific_design_judge_cache.jsonl"
+            FORMAT_BASE_REWARD = 0.10
+            SEMANTIC_REWARD_WEIGHT = 0.90
+            REWARD_FUNCTION_WEIGHTS = [1.0]
+            OPENAI_MAX_RETRIES = 3
+            OPENAI_TIMEOUT_SECONDS = 120.0
 
-            # GRPO
-            MAX_STEPS = 25
+            # GRPO optimization and sampling
+            NUM_TRAIN_EPOCHS = 1
+            MAX_STEPS = -1
             LEARNING_RATE = 5e-6
             TRAIN_BATCH_SIZE = 1
-            EVAL_BATCH_SIZE = 1
+            EVAL_BATCH_SIZE = 4
             GRADIENT_ACCUMULATION_STEPS = 4
             NUM_GENERATIONS = 4
             NUM_GENERATIONS_EVAL = 4
-            MAX_COMPLETION_LENGTH = 256
+            MAX_COMPLETION_LENGTH = 512
             TEMPERATURE = 0.8
             TOP_P = 0.95
+            TOP_K = 0
             BETA = 0.0
-            REWARD_WEIGHTS = [0.10, 0.15, 0.15, 0.60]
-            WARMUP_RATIO = 0.05
-            EVAL_STEPS = 10
-            SAVE_STEPS = 10
+            SCALE_REWARDS = "group"
+            MULTI_OBJECTIVE_AGGREGATION = "sum_then_normalize"
+            LOSS_TYPE = "dapo"
+            GRADIENT_CHECKPOINTING = True
+            GRADIENT_CHECKPOINTING_USE_REENTRANT = False
+            OPTIMIZER = "adamw_torch"
+            WARMUP_STEPS = 5
+            EVAL_STRATEGY = "steps"
+            EVAL_STEPS = 25
+            SAVE_STRATEGY = "steps"
+            SAVE_STEPS = 25
+            SAVE_TOTAL_LIMIT = None
             LOGGING_STEPS = 1
+            LOGGING_FIRST_STEP = True
+            LOG_COMPLETIONS = True
             NUM_COMPLETIONS_TO_PRINT = 4
+            REPORT_TO = "none"
+            USE_VLLM = False
             RANDOM_SEED = 17
+            PIN_MEMORY_ON_CUDA_ONLY = True
 
-            # Hugging Face publication: every GRPO checkpoint plus the final adapter
+            # Before/after inference comparison
+            MAX_NEW_TOKENS = 512
+            INFERENCE_DO_SAMPLE = False
+            INFERENCE_TEMPERATURE = 1.0
+            INFERENCE_TOP_P = 1.0
+
+            # Hugging Face publication
             DATASET_HF_REPO = "lamm-mit/scientific-sft-grpo-data"
-            SFT_HF_REPO = "lamm-mit/scientific-sft-grpo-sft"
-            GRPO_HF_REPO = "lamm-mit/scientific-sft-grpo-grpo"
+            DATASET_CONFIG_NAME = "scientific_design_grpo"
+            SFT_HF_REPO = "lamm-mit/scientific-sft-grpo-design-sft"
+            GRPO_HF_REPO = "lamm-mit/scientific-sft-grpo-design-grpo"
             PUSH_TO_HUB = True
+            HUB_STRATEGY = "all_checkpoints"
             HUB_PRIVATE_REPO = False
+            HUB_ALWAYS_PUSH = True
             HF_TOKEN = None
             # HF_TOKEN = os.environ["HF_TOKEN"]  # Optional; prefer `hf auth login`.
 
             require_openai_key()
             versions = require_training_stack()
             runtime = detect_runtime()
-            if JUDGE_MODEL != "gpt-5.6-terra":
-                raise RuntimeError("The tested semantic judge is gpt-5.6-terra.")
+            DATALOADER_PIN_MEMORY = (
+                runtime.backend == "cuda" if PIN_MEMORY_ON_CUDA_ONLY else True
+            )
+            if JUDGE_MODEL != "gpt-5.6-luna":
+                raise RuntimeError("The configured semantic judge must be gpt-5.6-luna.")
+            if abs(FORMAT_BASE_REWARD + SEMANTIC_REWARD_WEIGHT - 1.0) > 1e-9:
+                raise ValueError("Reward coefficients must sum to one.")
+            if EVAL_BATCH_SIZE % NUM_GENERATIONS_EVAL != 0:
+                raise ValueError(
+                    "EVAL_BATCH_SIZE must be divisible by NUM_GENERATIONS_EVAL."
+                )
             if PartialState().num_processes != 1:
                 raise RuntimeError("This API-judged teaching run requires WORLD_SIZE=1.")
-            configure_mechanism_judge(
+            configure_scientific_design_judge(
                 model=JUDGE_MODEL,
                 cache_path=JUDGE_CACHE,
+                format_base_reward=FORMAT_BASE_REWARD,
+                semantic_reward_weight=SEMANTIC_REWARD_WEIGHT,
+                api_max_retries=OPENAI_MAX_RETRIES,
+                api_timeout_seconds=OPENAI_TIMEOUT_SECONDS,
             )
             if PUSH_TO_HUB:
                 require_hf_namespace(GRPO_HF_REPO, token=HF_TOKEN)
-
             display(
                 JSON(
                     {
@@ -1152,7 +1376,9 @@ nb4 = notebook(
                         "versions": versions,
                         "model": MODEL_ID,
                         "sft_adapter": str(SFT_ADAPTER_SOURCE),
-                        "grpo_hub_repo": GRPO_HF_REPO,
+                        "judge_model": JUDGE_MODEL,
+                        "reward_formula": "F * (0.10 + 0.90 * J)",
+                        "hub_model": GRPO_HF_REPO,
                     }
                 )
             )
@@ -1160,11 +1386,10 @@ nb4 = notebook(
         ),
         markdown(
             """
-            ## 1. Load the GRPO data and the trainable SFT adapter
+            ## 1. Load the task-only GRPO data and trainable SFT adapter
 
-            Hidden columns remain in the dataset because custom reward functions receive them.
-            The model receives only `prompt`. Loading the SFT adapter with `is_trainable=True`
-            ensures GRPO updates the same LoRA parameters.
+            The policy receives only `prompt`. TRL passes the hidden rubric columns to the
+            reward function.
             """
         ),
         code(
@@ -1175,8 +1400,8 @@ nb4 = notebook(
                 raise RuntimeError("Run notebook 03 to create the SFT adapter.")
 
             grpo = load_from_disk(GRPO_DATA)
-            if len(grpo["train"]) == 0:
-                raise RuntimeError("The GRPO train split is empty.")
+            if len(grpo["train"]) == 0 or len(grpo["validation"]) == 0:
+                raise RuntimeError("GRPO train and validation splits must be non-empty.")
 
             tokenizer = load_tokenizer(MODEL_ID, token=HF_TOKEN)
             clear_device_cache(runtime)
@@ -1193,42 +1418,50 @@ nb4 = notebook(
         ),
         markdown(
             """
-            ## 2. Establish a pre-GRPO behavior snapshot
+            ## 2. Snapshot the SFT policy on one unseen test task
 
-            We keep the same held-out prompt before and after training. This is a qualitative
-            teaching comparison, not a claim of scientific benchmark performance.
+            This qualitative before/after comparison is useful for teaching but is not a
+            substitute for aggregate expert evaluation.
             """
         ),
         code(
             """
-            held_out_pool = grpo["test"] if len(grpo["test"]) else grpo["validation"]
-            if not len(held_out_pool):
-                raise RuntimeError("A validation or test task is required for comparison.")
-            held_out = held_out_pool[0]
+            held_out = grpo["test"][0]
             held_out_prompt = render_prompt(tokenizer, held_out["prompt"])
-            before_grpo = generate_text(model, tokenizer, held_out_prompt, runtime)
+            before_grpo = generate_text(
+                model,
+                tokenizer,
+                held_out_prompt,
+                runtime,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=INFERENCE_DO_SAMPLE,
+                temperature=INFERENCE_TEMPERATURE,
+                top_p=INFERENCE_TOP_P,
+            )
             display(Markdown("### SFT policy\\n```text\\n" + before_grpo + "\\n```"))
             """
         ),
         markdown(
             """
-            ## 3. Configure mechanism-sensitive GRPO
+            ## 3. Configure the exact combined reward
 
-            Reward weights intentionally make causal judgment dominant:
+            For each completion:
 
-            - format: 0.10
-            - task-grounded evidence: 0.15
-            - rubric concept coverage: 0.15
-            - batched `gpt-5.6-terra` mechanism judge: 0.60
+            1. `F=1` only when all four non-empty sections appear in exact order; otherwise
+               `F=0` and the reward is zero without calling Luna.
+            2. Luna assigns integer 0–4 scores for brainstorm, principles, synthesis, and
+               answer.
+            3. `J=(B+P+S+A)/16`.
+            4. `R=F×(0.10+0.90J)`.
 
-            Deterministic checks constrain obvious failure modes; the semantic judge evaluates
-            causal direction, intermediate steps, support, and scientific coherence.
+            GRPO then normalizes these raw rewards within each four-completion group.
             """
         ),
         code(
             """
             grpo_args = GRPOConfig(
                 output_dir=str(GRPO_ADAPTER),
+                num_train_epochs=NUM_TRAIN_EPOCHS,
                 max_steps=MAX_STEPS,
                 learning_rate=LEARNING_RATE,
                 per_device_train_batch_size=TRAIN_BATCH_SIZE,
@@ -1239,48 +1472,47 @@ nb4 = notebook(
                 max_completion_length=MAX_COMPLETION_LENGTH,
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
+                top_k=TOP_K,
                 beta=BETA,
-                reward_weights=REWARD_WEIGHTS,
-                scale_rewards="group",
-                loss_type="dapo",
+                reward_weights=REWARD_FUNCTION_WEIGHTS,
+                scale_rewards=SCALE_REWARDS,
+                multi_objective_aggregation=MULTI_OBJECTIVE_AGGREGATION,
+                loss_type=LOSS_TYPE,
                 remove_unused_columns=False,
                 chat_template_kwargs={"enable_thinking": False},
-                gradient_checkpointing=True,
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-                optim="adamw_torch",
-                warmup_ratio=WARMUP_RATIO,
-                eval_strategy="steps",
+                gradient_checkpointing=GRADIENT_CHECKPOINTING,
+                gradient_checkpointing_kwargs={
+                    "use_reentrant": GRADIENT_CHECKPOINTING_USE_REENTRANT
+                },
+                optim=OPTIMIZER,
+                warmup_steps=WARMUP_STEPS,
+                eval_strategy=EVAL_STRATEGY,
                 eval_steps=EVAL_STEPS,
-                save_strategy="steps",
+                save_strategy=SAVE_STRATEGY,
                 save_steps=SAVE_STEPS,
-                save_total_limit=None,
+                save_total_limit=SAVE_TOTAL_LIMIT,
                 logging_steps=LOGGING_STEPS,
-                logging_first_step=True,
-                log_completions=True,
+                logging_first_step=LOGGING_FIRST_STEP,
+                log_completions=LOG_COMPLETIONS,
                 num_completions_to_print=NUM_COMPLETIONS_TO_PRINT,
-                report_to="none",
+                report_to=REPORT_TO,
+                dataloader_pin_memory=DATALOADER_PIN_MEMORY,
                 push_to_hub=PUSH_TO_HUB,
                 hub_model_id=GRPO_HF_REPO,
-                hub_strategy="all_checkpoints",
+                hub_strategy=HUB_STRATEGY,
                 hub_private_repo=HUB_PRIVATE_REPO,
                 hub_token=HF_TOKEN,
-                hub_always_push=True,
+                hub_always_push=HUB_ALWAYS_PUSH,
                 bf16=runtime.trainer_bf16,
                 fp16=runtime.trainer_fp16,
                 use_cpu=runtime.use_cpu,
-                use_vllm=False,
+                use_vllm=USE_VLLM,
                 seed=RANDOM_SEED,
             )
-
             trainer = GRPOTrainer(
                 model=model,
                 args=grpo_args,
-                reward_funcs=[
-                    format_reward,
-                    evidence_grounding_reward,
-                    concept_coverage_reward,
-                    mechanism_judge_reward,
-                ],
+                reward_funcs=[scientific_design_reward],
                 train_dataset=grpo["train"],
                 eval_dataset=grpo["validation"],
                 processing_class=tokenizer,
@@ -1289,11 +1521,10 @@ nb4 = notebook(
         ),
         markdown(
             """
-            ## 4. Train and inspect reward dynamics
+            ## 4. Train, evaluate, checkpoint, and publish
 
-            A rising total reward is not enough: inspect the individual components. If format
-            rises while semantic reward stagnates, the policy is learning the shell but not a
-            better mechanism.
+            The Luna cache is append-only and content-addressed, so completed judgments are
+            reused after interruption. Every saved trainer checkpoint is published.
             """
         ),
         code(
@@ -1305,7 +1536,7 @@ nb4 = notebook(
             tokenizer.save_pretrained(GRPO_ADAPTER)
             if PUSH_TO_HUB:
                 hub_result = trainer.push_to_hub(
-                    commit_message="Complete mechanism GRPO training"
+                    commit_message="Complete scientific design GRPO training"
                 )
                 print(f"Published final adapter and all checkpoints: {hub_result}")
             display(JSON(train_result.metrics))
@@ -1321,38 +1552,54 @@ nb4 = notebook(
                 or (column.startswith("rewards/") and column.endswith("/mean"))
             ]
             if reward_columns:
-                history[["step", *reward_columns]].dropna(how="all", subset=reward_columns).plot(
-                    x="step", y=reward_columns, figsize=(12, 5), marker="o"
+                history[["step", *reward_columns]].dropna(
+                    how="all",
+                    subset=reward_columns,
+                ).plot(
+                    x="step",
+                    y=reward_columns,
+                    figsize=(12, 5),
+                    marker="o",
                 )
-                plt.title("GRPO reward components")
+                plt.title("Combined Luna GRPO reward")
                 plt.ylabel("reward")
                 plt.tight_layout()
                 plt.show()
             else:
-                print("Reward columns available after this run:", sorted(history.columns))
+                print("Reward columns available:", sorted(history.columns))
             """
         ),
         markdown(
             """
-            ## 5. Compare the same unseen mechanism task
+            ## 5. Compare the same unseen task
 
-            Look for an ordered, supported causal explanation—not a particular phrase. The
-            source document is unnecessary because the task itself contains the relevant
-            observations.
+            Inspect whether the GRPO policy develops more distinct candidates, states the
+            relevant constraints, synthesizes rather than lists, and provides a defensible
+            final answer.
             """
         ),
         code(
             """
-            after_grpo = generate_text(trainer.model, tokenizer, held_out_prompt, runtime)
+            after_grpo = generate_text(
+                trainer.model,
+                tokenizer,
+                held_out_prompt,
+                runtime,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=INFERENCE_DO_SAMPLE,
+                temperature=INFERENCE_TEMPERATURE,
+                top_p=INFERENCE_TOP_P,
+            )
             display(Markdown("### Before GRPO\\n```text\\n" + before_grpo + "\\n```"))
             display(Markdown("### After GRPO\\n```text\\n" + after_grpo + "\\n```"))
-            display(Markdown("### Hidden reference (for instructor inspection)"))
+            display(Markdown("### Hidden instructor rubric"))
             display(
                 JSON(
                     {
-                        "mechanism_steps": held_out["mechanism_steps"],
-                        "causal_links": held_out["causal_links"],
-                        "reference_answer": held_out["reference_answer"],
+                        "required_constraints": held_out["required_constraints"],
+                        "evaluation_criteria": held_out["evaluation_criteria"],
+                        "acceptable_alternatives": held_out["acceptable_alternatives"],
+                        "failure_modes": held_out["failure_modes"],
                     }
                 )
             )
@@ -1360,16 +1607,13 @@ nb4 = notebook(
         ),
         markdown(
             """
-            ## Result and responsible interpretation
+            ## Result and research caveat
 
-            `artifacts/gemma4-mechanism-grpo/` is the final LoRA adapter. The final adapter and
-            every saved checkpoint are also published to
-            `lamm-mit/scientific-sft-grpo-grpo`. At inference, attach it to the same base model
-            and submit any self-contained scientific mechanism task.
-
-            For real research, add expert adjudication, inter-rater reliability, domain-specific
-            test sets, ablations for each reward component, contamination checks, and multiple
-            seeds. An LLM judge is scalable supervision—not ground truth.
+            The final adapter is in `artifacts/gemma4-scientific-design-grpo/` and on the
+            configured Hub repository with all saved checkpoints. For research claims, add
+            expert grading, inter-rater agreement, multiple seeds, reward ablations,
+            contamination checks, and domain-specific held-out evaluations. Luna provides
+            scalable supervision—not scientific ground truth.
             """
         ),
     ]
@@ -1379,8 +1623,8 @@ nb4 = notebook(
 def main() -> None:
     NOTEBOOKS.mkdir(parents=True, exist_ok=True)
     outputs = {
-        "01_generate_mechanism_sft_dataset.ipynb": nb1,
-        "02_build_mechanism_grpo_dataset.ipynb": nb2,
+        "01_generate_scientific_design_sft_dataset.ipynb": nb1,
+        "02_generate_scientific_design_grpo_dataset.ipynb": nb2,
         "03_finetune_sft_lora.ipynb": nb3,
         "04_finetune_grpo_lora.ipynb": nb4,
     }
