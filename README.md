@@ -1,8 +1,8 @@
 # Scientific Problem-Solving SFT + GRPO
 
-Four teaching notebooks that turn openly licensed scientific text into task-only
-problem-solving datasets, train a Gemma 4 LoRA adapter with supervised fine-tuning, and
-continue it with a simple `gpt-5.6-luna` GRPO reward.
+Four teaching notebooks plus reproducible training CLIs that turn openly licensed scientific
+text into task-only problem-solving datasets, train a Gemma 4 LoRA adapter with supervised
+fine-tuning, and continue it with a simple `gpt-5.6-luna` GRPO reward.
 
 The student model never receives a paper passage. Source text is used once by a teacher and
 critic to author a new self-contained task, then removed from the policy-facing datasets.
@@ -109,6 +109,13 @@ All candidates in a trainer batch are judged in one structured-output request. R
 cached using a hash of the task, rubric, completion, judge model, and judge-prompt version.
 TRL then normalizes raw rewards within each four-completion group.
 
+The default GRPO run now performs held-out evaluation once per epoch
+(`eval_strategy = "epoch"`), while checkpoints are still saved every 25 steps. One complete
+evaluation generates four rollouts for each of 75 validation tasks—up to 300 Luna-graded
+responses—so evaluating every 25 training steps is unnecessarily expensive for this class
+exercise. Set `eval_strategy = "steps"` and `eval_steps = 250` in the notebook or TOML if
+periodic validation is preferred.
+
 The API judge is needed only during GRPO training. The final adapter does not call Luna at
 inference.
 
@@ -152,6 +159,76 @@ the SFT adapter directly from the repositories below. You do not need to run not
 before starting notebook 04. To use locally generated artifacts instead, change the explicit
 `*_SOURCE_MODE` variables from `"hub"` to `"local"` in the corresponding training notebook.
 
+Notebook 04 ends with a fresh-kernel inference cell. It independently loads the base model and
+final GRPO adapter from Hugging Face, so it still works after closing and reopening Jupyter.
+The same cell can load a specific published `checkpoint-*` subfolder, revision, tag, or commit.
+Inference does not use Luna and does not require `OPENAI_API_KEY`.
+
+## Training from the CLI
+
+The notebooks remain the visual, explanatory teaching path. The CLI is an additional
+non-interactive path for a DGX, workstation, remote VS Code terminal, `tmux`, or a scheduler.
+It uses the same datasets, model, LoRA settings, reward, and training defaults.
+
+First inspect the fully parsed settings:
+
+```bash
+scientific-sft-grpo show-config --stage sft --config configs/sft.toml
+scientific-sft-grpo show-config --stage grpo --config configs/grpo.toml
+```
+
+Run the read-only preflight. It checks the installed stack, selected accelerator, gated model
+access, dataset schema, checkpoint state, and Hub write namespace. GRPO also checks the SFT
+adapter, `OPENAI_API_KEY`, and the required single-process execution mode.
+
+```bash
+scientific-sft-grpo doctor --stage sft --config configs/sft.toml
+scientific-sft-grpo doctor --stage grpo --config configs/grpo.toml
+```
+
+Train SFT and then GRPO:
+
+```bash
+scientific-sft-grpo sft --config configs/sft.toml
+scientific-sft-grpo grpo --config configs/grpo.toml
+```
+
+Both committed configurations use `resume = "auto"`. The CLI resumes the numerically latest
+local `checkpoint-*` directory when one exists and starts at step zero otherwise. It never
+silently downloads a Hub checkpoint as trainer state. Override the behavior explicitly:
+
+```bash
+scientific-sft-grpo sft --config configs/sft.toml --resume none
+scientific-sft-grpo grpo --config configs/grpo.toml --resume auto
+scientific-sft-grpo grpo \
+  --config configs/grpo.toml \
+  --resume artifacts/gemma4-scientific-design-grpo/checkpoint-100
+```
+
+For a one-step installation and memory check:
+
+```bash
+scientific-sft-grpo sft --config configs/sft.toml --smoke-test
+scientific-sft-grpo grpo --config configs/grpo.toml --smoke-test
+```
+
+A smoke test selects at most eight training and four validation examples, writes to a
+separate `*-smoke` output directory, ignores existing checkpoints, and disables all Hub
+writes. The GRPO smoke test still creates real completions and real Luna judge calls.
+
+Normal runs follow the `push = true` setting and publish every trainer checkpoint plus the
+final adapter. Use `--no-push` for a local run or `--push` to override a disabled config.
+Every output directory also contains:
+
+- `resolved_config.json`: secret-free configuration, package versions, device, and resume
+  decision;
+- `train_metrics.json`: final `trainer.train()` metrics; and
+- `log_history.jsonl`: the complete trainer history for later plots and analysis.
+
+Edit [`configs/sft.toml`](configs/sft.toml) or
+[`configs/grpo.toml`](configs/grpo.toml) to change the full run. Tokens are intentionally not
+accepted in TOML: use cached `hf auth login`, optional `HF_TOKEN`, and `OPENAI_API_KEY`.
+
 ## Dataset structure
 
 The local canonical records retain:
@@ -177,10 +254,10 @@ The policy-facing projections differ:
 TRL receives the GRPO rubric columns for the reward function, but the policy receives only
 `prompt`.
 
-## Parameters are notebook-local
+## Explicit parameters
 
-Every non-secret setting used by the workflow appears in a notebook configuration cell,
-including:
+Every non-secret setting used by the workflow appears in a notebook configuration cell. The
+training settings are mirrored in the two committed TOML files for CLI execution, including:
 
 - accepted split targets and task-family weights;
 - source pool and scan limits;

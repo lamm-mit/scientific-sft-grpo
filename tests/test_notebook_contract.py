@@ -58,3 +58,12 @@ def test_training_notebooks_expose_models_training_and_hub_parameters():
     assert "FORMAT_BASE_REWARD = 0.10" in grpo
     assert "SEMANTIC_REWARD_WEIGHT = 0.90" in grpo
     assert "NUM_GENERATIONS = 4" in grpo
+    assert 'EVAL_STRATEGY = "epoch"' in grpo
+    assert "EVAL_STEPS = None" in grpo
+    assert (
+        'INFERENCE_ADAPTER_REPO = "lamm-mit/scientific-sft-grpo-design-grpo"'
+        in grpo
+    )
+    assert "INFERENCE_ADAPTER_SUBFOLDER = None" in grpo
+    assert "PeftModel.from_pretrained(" in grpo
+    assert "task_prompt(INFERENCE_TASK)" in grpo

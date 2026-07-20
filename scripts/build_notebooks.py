@@ -1355,8 +1355,11 @@ nb4 = notebook(
             GRADIENT_CHECKPOINTING_USE_REENTRANT = False
             OPTIMIZER = "adamw_torch"
             WARMUP_STEPS = 5
-            EVAL_STRATEGY = "steps"
-            EVAL_STEPS = 25
+            # Full GRPO evaluation is expensive: 75 tasks × 4 rollouts = 300
+            # candidate responses plus Luna grading. With one epoch, "epoch" runs it once.
+            # For periodic evaluation instead, use "steps" and set EVAL_STEPS (for example 250).
+            EVAL_STRATEGY = "epoch"
+            EVAL_STEPS = None
             SAVE_STRATEGY = "steps"
             SAVE_STEPS = 25
             SAVE_TOTAL_LIMIT = None
@@ -1595,6 +1598,12 @@ nb4 = notebook(
 
             The Luna cache is append-only and content-addressed, so completed judgments are
             reused after interruption. Every saved trainer checkpoint is published.
+
+            With the default `EVAL_STRATEGY="epoch"` and one training epoch, held-out
+            evaluation runs once at the end. It generates four fresh rollouts for each of the
+            75 validation tasks and applies the same reward function—up to 300 Luna judgments.
+            These `eval_*` rewards are diagnostics and do not update the policy. The
+            unprefixed training reward is the signal used by GRPO.
             """
         ),
         code(
@@ -1615,12 +1624,22 @@ nb4 = notebook(
         code(
             """
             history = pd.DataFrame(trainer.state.log_history)
-            reward_columns = [
+            training_reward_columns = [
                 column
                 for column in history.columns
                 if column == "reward"
                 or (column.startswith("rewards/") and column.endswith("/mean"))
             ]
+            evaluation_reward_columns = [
+                column
+                for column in history.columns
+                if column == "eval_reward"
+                or (
+                    column.startswith("eval_rewards/")
+                    and column.endswith("/mean")
+                )
+            ]
+            reward_columns = training_reward_columns + evaluation_reward_columns
             if reward_columns:
                 history[["step", *reward_columns]].dropna(
                     how="all",
@@ -1631,7 +1650,7 @@ nb4 = notebook(
                     figsize=(12, 5),
                     marker="o",
                 )
-                plt.title("Combined Luna GRPO reward")
+                plt.title("Training reward and held-out evaluation reward")
                 plt.ylabel("reward")
                 plt.tight_layout()
                 plt.show()
@@ -1677,6 +1696,111 @@ nb4 = notebook(
         ),
         markdown(
             """
+            ## 6. Fresh-kernel inference from Hugging Face
+
+            The preceding comparison intentionally uses the in-memory trainer. This cell is
+            independent of that state: it can be run after reopening the notebook or in a
+            fresh kernel. By default it loads the final adapter from the root of the GRPO Hub
+            repository. Set `INFERENCE_ADAPTER_SUBFOLDER` to a published `checkpoint-*`
+            directory, or set `INFERENCE_ADAPTER_REVISION` to a branch, tag, or commit.
+
+            Inference requires Hugging Face access to gated Gemma weights but does **not**
+            require an OpenAI key or a Luna call.
+            """
+        ),
+        code(
+            """
+            import gc
+            import os
+
+            from IPython.display import Markdown, display
+            from peft import PeftModel
+
+            from science_course.data import task_prompt
+            from science_course.devices import clear_device_cache, detect_runtime
+            from science_course.modeling import (
+                generate_text,
+                load_causal_lm,
+                load_tokenizer,
+                render_prompt,
+            )
+
+            # All fresh-kernel inference settings are explicit here.
+            INFERENCE_BASE_MODEL_ID = "google/gemma-4-E4B-it"
+            INFERENCE_ADAPTER_REPO = "lamm-mit/scientific-sft-grpo-design-grpo"
+            INFERENCE_ADAPTER_REVISION = None  # Optional branch, tag, or commit hash.
+            INFERENCE_ADAPTER_SUBFOLDER = None  # Example: "checkpoint-100".
+            INFERENCE_MAX_NEW_TOKENS = 512
+            INFERENCE_DO_SAMPLE = False
+            INFERENCE_TEMPERATURE = 1.0
+            INFERENCE_TOP_P = 1.0
+            INFERENCE_HF_TOKEN = None
+            # INFERENCE_HF_TOKEN = os.environ["HF_TOKEN"]  # Optional; cached login is preferred.
+
+            INFERENCE_TASK = (
+                "Design a self-healing hydrogel for repeated deformation in water. "
+                "The material may use reversible physical interactions, but recovery must "
+                "not require external heating. Develop several mechanistic strategies, "
+                "identify the governing design principles, synthesize the strongest design, "
+                "and give a final recommendation."
+            )
+
+            # Release any prior trainer/model objects if this cell follows training.
+            for object_name in ("trainer", "model", "base_model"):
+                globals().pop(object_name, None)
+            gc.collect()
+
+            inference_runtime = detect_runtime()
+            clear_device_cache(inference_runtime)
+            inference_tokenizer = load_tokenizer(
+                INFERENCE_BASE_MODEL_ID,
+                token=INFERENCE_HF_TOKEN,
+            )
+            inference_base_model = load_causal_lm(
+                INFERENCE_BASE_MODEL_ID,
+                inference_runtime,
+                token=INFERENCE_HF_TOKEN,
+            )
+            adapter_load_kwargs = {
+                "is_trainable": False,
+                "token": INFERENCE_HF_TOKEN,
+            }
+            if INFERENCE_ADAPTER_REVISION is not None:
+                adapter_load_kwargs["revision"] = INFERENCE_ADAPTER_REVISION
+            if INFERENCE_ADAPTER_SUBFOLDER is not None:
+                adapter_load_kwargs["subfolder"] = INFERENCE_ADAPTER_SUBFOLDER
+            inference_model = PeftModel.from_pretrained(
+                inference_base_model,
+                INFERENCE_ADAPTER_REPO,
+                **adapter_load_kwargs,
+            )
+
+            inference_prompt = render_prompt(
+                inference_tokenizer,
+                task_prompt(INFERENCE_TASK),
+            )
+            inference_response = generate_text(
+                inference_model,
+                inference_tokenizer,
+                inference_prompt,
+                inference_runtime,
+                max_new_tokens=INFERENCE_MAX_NEW_TOKENS,
+                do_sample=INFERENCE_DO_SAMPLE,
+                temperature=INFERENCE_TEMPERATURE,
+                top_p=INFERENCE_TOP_P,
+            )
+            display(
+                Markdown(
+                    "### Reloaded GRPO adapter response\\n"
+                    f"Repository: `{INFERENCE_ADAPTER_REPO}`  \\n"
+                    f"Subfolder: `{INFERENCE_ADAPTER_SUBFOLDER or 'final adapter'}`\\n\\n"
+                    f"```text\\n{inference_response}\\n```"
+                )
+            )
+            """
+        ),
+        markdown(
+            """
             ## Result and research caveat
 
             The final adapter is in `artifacts/gemma4-scientific-design-grpo/` and on the
@@ -1700,6 +1824,17 @@ def main() -> None:
     }
     for name, artifact in outputs.items():
         path = NOTEBOOKS / name
+        if path.exists():
+            existing = nbf.read(path, as_version=4)
+            existing_ids = {
+                (cell.cell_type, cell.source): cell.id
+                for cell in existing.cells
+                if cell.get("id")
+            }
+            for cell in artifact.cells:
+                prior_id = existing_ids.get((cell.cell_type, cell.source))
+                if prior_id is not None:
+                    cell.id = prior_id
         nbf.write(artifact, path)
         print(path.relative_to(ROOT))
 

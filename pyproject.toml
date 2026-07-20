@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scientific-sft-grpo"
-version = "0.2.0"
+version = "0.3.0"
 description = "Task-only scientific problem-solving datasets, LoRA SFT, and Luna-judged GRPO"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,6 +39,9 @@ dev = [
 Repository = "https://github.com/lamm-mit/scientific-sft-grpo"
 Documentation = "https://huggingface.co/docs/trl"
 Dataset = "https://huggingface.co/datasets/lamm-mit/scientific-sft-grpo-data"
+
+[project.scripts]
+scientific-sft-grpo = "science_course.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
