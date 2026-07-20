@@ -1,0 +1,45 @@
+[models]
+teacher_model = "gpt-5.6-terra"
+critic_model = "gpt-5.6-terra"
+
+[targets]
+train = 500
+validation = 75
+
+[task_family_weights]
+mechanism_guided_design = 0.25
+experimental_design = 0.25
+troubleshooting = 0.20
+hypothesis_development = 0.15
+cross_domain_synthesis = 0.15
+
+[source]
+dataset_id = "common-pile/peS2o"
+split = "train"
+candidate_limit = 2500
+max_records_scanned = 200000
+min_chars = 1200
+max_chars = 6000
+seed = 17
+
+[generation]
+concurrency = 8
+max_attempts = 2500
+openai_max_retries = 3
+openai_timeout_seconds = 120.0
+
+[output]
+name = "scientific_design_sft"
+raw_sources_path = "data/raw/scientific_design_sft_sources.jsonl"
+accepted_path = "data/canonical/scientific_design_sft_tasks.jsonl"
+rejected_path = "data/canonical/scientific_design_sft_rejected.jsonl"
+dataset_directory = "data/processed/scientific_design_sft"
+parquet_directory = "data/processed"
+parquet_prefix = "scientific_design_sft"
+manifest_path = "data/canonical/scientific_design_sft_manifest.json"
+
+[hub]
+repo_id = "lamm-mit/scientific-sft-grpo-data"
+config_name = "scientific_design_sft"
+push = true
+private = false

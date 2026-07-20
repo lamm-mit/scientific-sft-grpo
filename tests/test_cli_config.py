@@ -9,9 +9,12 @@ from science_course.cli_config import (
     SFTJobConfig,
     latest_checkpoint,
     load_grpo_config,
+    load_grpo_generation_config,
     load_sft_config,
+    load_sft_generation_config,
     resolve_resume,
     with_cli_overrides,
+    with_generation_push_override,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +49,54 @@ def test_committed_grpo_config_matches_notebook_contract():
     assert config.training.eval_steps is None
     assert config.training.loss_type == "dapo"
     assert config.hub.repo_id == "lamm-mit/scientific-sft-grpo-design-grpo"
+
+
+def test_committed_generation_configs_match_notebook_contract():
+    sft = load_sft_generation_config(ROOT / "configs" / "generate_sft.toml")
+    grpo = load_grpo_generation_config(ROOT / "configs" / "generate_grpo.toml")
+
+    assert sft.targets.split_targets == {
+        "sft_train": 500,
+        "sft_validation": 75,
+    }
+    assert sft.source.candidate_limit == 2500
+    assert sft.output.accepted_path.endswith("scientific_design_sft_tasks.jsonl")
+    assert sft.hub.config_name == "scientific_design_sft"
+    assert grpo.targets.split_targets == {
+        "grpo_train": 500,
+        "grpo_validation": 75,
+        "test": 100,
+    }
+    assert grpo.input.sft_canonical_path == (
+        "data/canonical/scientific_design_sft_tasks.jsonl"
+    )
+    assert grpo.source.seed == 29
+    assert grpo.hub.config_name == "scientific_design_grpo"
+
+
+def test_large_generation_configs_have_exact_requested_totals_and_isolated_paths():
+    sft = load_sft_generation_config(ROOT / "configs" / "generate_sft_L.toml")
+    grpo = load_grpo_generation_config(ROOT / "configs" / "generate_grpo_L.toml")
+
+    assert sum(sft.targets.split_targets.values()) == 10_000
+    assert sft.targets.train == 9000
+    assert sft.targets.validation == 1000
+    assert sum(grpo.targets.split_targets.values()) == 1000
+    assert grpo.targets.train == 800
+    assert grpo.targets.validation == grpo.targets.test == 100
+    assert sft.output.name == "scientific_design_sft_L"
+    assert grpo.output.name == "scientific_design_grpo_L"
+    assert grpo.input.sft_canonical_path == sft.output.accepted_path
+    assert sft.hub.config_name != "scientific_design_sft"
+    assert grpo.hub.config_name != "scientific_design_grpo"
+
+
+def test_generation_push_override_does_not_mutate_original():
+    config = load_sft_generation_config(ROOT / "configs" / "generate_sft.toml")
+    local = with_generation_push_override(config, push=False)
+
+    assert config.hub.push is True
+    assert local.hub.push is False
 
 
 def test_latest_checkpoint_is_numeric_and_ignores_invalid_directories(tmp_path):
@@ -106,3 +157,21 @@ def test_cli_show_config_has_no_credentials(capsys):
     assert '"judge_model": "gpt-5.6-luna"' in captured.out
     assert "OPENAI_API_KEY" not in captured.out
     assert "HF_TOKEN" not in captured.out
+
+
+def test_cli_shows_large_generation_config(capsys):
+    result = main(
+        [
+            "show-config",
+            "--stage",
+            "generate-sft",
+            "--config",
+            str(ROOT / "configs" / "generate_sft_L.toml"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == 0
+    assert '"train": 9000' in captured.out
+    assert '"validation": 1000' in captured.out
+    assert "scientific_design_sft_L" in captured.out

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scientific-sft-grpo"
-version = "0.3.0"
+version = "0.4.0"
 description = "Task-only scientific problem-solving datasets, LoRA SFT, and Luna-judged GRPO"
 readme = "README.md"
 requires-python = ">=3.11"

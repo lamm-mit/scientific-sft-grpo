@@ -1,8 +1,9 @@
 # Scientific Problem-Solving SFT + GRPO
 
-Four teaching notebooks plus reproducible training CLIs that turn openly licensed scientific
-text into task-only problem-solving datasets, train a Gemma 4 LoRA adapter with supervised
-fine-tuning, and continue it with a simple `gpt-5.6-luna` GRPO reward.
+Four teaching notebooks plus reproducible dataset-generation and training CLIs that turn
+openly licensed scientific text into task-only problem-solving datasets, train a Gemma 4
+LoRA adapter with supervised fine-tuning, and continue it with a simple `gpt-5.6-luna` GRPO
+reward.
 
 The student model never receives a paper passage. Source text is used once by a teacher and
 critic to author a new self-contained task, then removed from the policy-facing datasets.
@@ -164,6 +165,103 @@ final GRPO adapter from Hugging Face, so it still works after closing and reopen
 The same cell can load a specific published `checkpoint-*` subfolder, revision, tag, or commit.
 Inference does not use Luna and does not require `OPENAI_API_KEY`.
 
+## Dataset generation from the CLI
+
+Notebooks 01 and 02 remain the visual teaching path. The two additional CLI commands run the
+same accepted-quota teacher/critic workflow without Jupyter:
+
+```bash
+scientific-sft-grpo generate-sft --config configs/generate_sft.toml
+scientific-sft-grpo generate-grpo --config configs/generate_grpo.toml
+```
+
+The SFT command:
+
+1. streams and license-filters `common-pile/peS2o`;
+2. asks `gpt-5.6-terra` to author a self-contained task, reference work product, and hidden
+   rubric;
+3. uses an independent Terra critic call to accept or reject it;
+4. continues until every SFT split/family accepted quota is full;
+5. writes canonical accepted/rejected JSONL journals;
+6. projects only task + reference completion into SFT Arrow and Parquet outputs; and
+7. optionally publishes the configured Hugging Face dataset configuration.
+
+The GRPO command follows the same process, but first reads the SFT canonical journal and
+excludes every SFT paper from its source pool. Its policy-facing projection contains the task
+and hidden rubric, but no reference completion. GRPO generation must therefore run after the
+matching SFT generation.
+
+Both commands are automatically resumable. Every completed source is immediately appended to
+the accepted or rejected journal. Rerunning the identical command skips those source papers
+and continues the remaining quotas. A manifest prevents a resume from silently mixing
+different teacher models, task-family weights, source filters, seeds, or prompt versions.
+Increasing `candidate_limit` and `max_attempts` is allowed if the initial budget is
+insufficient; decreasing accepted targets or changing the immutable contract requires a new
+output name and paths.
+
+Inspect a generation job without making API calls:
+
+```bash
+scientific-sft-grpo show-config \
+  --stage generate-sft \
+  --config configs/generate_sft.toml
+
+scientific-sft-grpo show-config \
+  --stage generate-grpo \
+  --config configs/generate_grpo.toml
+```
+
+Use `--no-push` to produce only local Arrow and Parquet artifacts:
+
+```bash
+scientific-sft-grpo generate-sft \
+  --config configs/generate_sft.toml \
+  --no-push
+```
+
+### Large `L` datasets: 10,000 SFT and 1,000 GRPO
+
+Two isolated large-run configurations are committed. They do not overwrite the teaching
+datasets:
+
+| Configuration | Splits | Accepted total | Hub configuration |
+|---|---|---:|---|
+| `generate_sft_L.toml` | 9,000 train + 1,000 validation | 10,000 | `scientific_design_sft_L` |
+| `generate_grpo_L.toml` | 800 train + 100 validation + 100 test | 1,000 | `scientific_design_grpo_L` |
+
+Run them in order:
+
+```bash
+export OPENAI_API_KEY="..."
+hf auth login
+
+mkdir -p logs
+
+scientific-sft-grpo generate-sft \
+  --config configs/generate_sft_L.toml \
+  2>&1 | tee logs/generate-sft-L.log
+
+scientific-sft-grpo generate-grpo \
+  --config configs/generate_grpo_L.toml \
+  2>&1 | tee logs/generate-grpo-L.log
+```
+
+The large SFT configuration allows up to 40,000 source attempts and the GRPO configuration
+allows up to 5,000. An attempt always makes a teacher call; teacher-valid drafts also make a
+critic call. These are maximum budgets rather than cost estimates. Review your OpenAI rate
+limits and expected spend before starting. Concurrency is set to 16 and can be reduced in TOML
+without invalidating a resume.
+
+For a long remote run, put the same command in `tmux`. Progress reports accepted examples,
+not merely attempted sources. If generation stops with quota deficits, increase
+`source.candidate_limit`, `source.max_records_scanned`, and
+`generation.max_attempts`, then rerun the same command.
+
+The large GRPO config points to
+`data/canonical/scientific_design_sft_L_tasks.jsonl`, guaranteeing its source pool excludes the
+10,000-example SFT curriculum. Both `L` datasets publish as separate configurations inside
+`lamm-mit/scientific-sft-grpo-data`.
+
 ## Training from the CLI
 
 The notebooks remain the visual, explanatory teaching path. The CLI is an additional
@@ -226,8 +324,9 @@ Every output directory also contains:
 - `log_history.jsonl`: the complete trainer history for later plots and analysis.
 
 Edit [`configs/sft.toml`](configs/sft.toml) or
-[`configs/grpo.toml`](configs/grpo.toml) to change the full run. Tokens are intentionally not
-accepted in TOML: use cached `hf auth login`, optional `HF_TOKEN`, and `OPENAI_API_KEY`.
+[`configs/grpo.toml`](configs/grpo.toml) to change the full training run. Tokens are
+intentionally not accepted in TOML: use cached `hf auth login`, optional `HF_TOKEN`, and
+`OPENAI_API_KEY`.
 
 ## Dataset structure
 

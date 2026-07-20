@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
+from .data import TASK_FAMILIES
+
 
 @dataclass(frozen=True)
 class RuntimeOptions:
@@ -219,6 +221,150 @@ class GRPOJobConfig:
     hub: HubOptions
 
 
+@dataclass(frozen=True)
+class GenerationModelsOptions:
+    teacher_model: str = "gpt-5.6-terra"
+    critic_model: str = "gpt-5.6-terra"
+
+
+@dataclass(frozen=True)
+class SourcePoolOptions:
+    dataset_id: str = "common-pile/peS2o"
+    split: str = "train"
+    candidate_limit: int = 2500
+    max_records_scanned: int = 200_000
+    min_chars: int = 1200
+    max_chars: int = 6000
+    seed: int = 17
+
+    def __post_init__(self) -> None:
+        if self.candidate_limit <= 0 or self.max_records_scanned <= 0:
+            raise ValueError("Source candidate and scan limits must be positive.")
+        if not 0 < self.min_chars < self.max_chars:
+            raise ValueError("Source character limits must satisfy 0 < min_chars < max_chars.")
+
+
+@dataclass(frozen=True)
+class GenerationAPIOptions:
+    concurrency: int = 8
+    max_attempts: int = 2500
+    openai_max_retries: int = 3
+    openai_timeout_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        if self.concurrency < 1:
+            raise ValueError("generation.concurrency must be at least one.")
+        if self.max_attempts < 1:
+            raise ValueError("generation.max_attempts must be positive.")
+        if self.openai_max_retries < 0 or self.openai_timeout_seconds <= 0:
+            raise ValueError("OpenAI retry and timeout settings are invalid.")
+
+
+@dataclass(frozen=True)
+class GenerationOutputOptions:
+    name: str
+    raw_sources_path: str
+    accepted_path: str
+    rejected_path: str
+    dataset_directory: str
+    parquet_directory: str = "data/processed"
+    parquet_prefix: str = ""
+    manifest_path: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.name or "/" in self.name or "\\" in self.name:
+            raise ValueError("output.name must be a non-empty filesystem-safe name.")
+        required = (
+            self.raw_sources_path,
+            self.accepted_path,
+            self.rejected_path,
+            self.dataset_directory,
+            self.parquet_prefix,
+            self.manifest_path,
+        )
+        if not all(required):
+            raise ValueError("All generation output paths and prefixes must be configured.")
+
+
+@dataclass(frozen=True)
+class DatasetPublicationOptions:
+    repo_id: str = "lamm-mit/scientific-sft-grpo-data"
+    config_name: str = ""
+    push: bool = True
+    private: bool = False
+
+    def __post_init__(self) -> None:
+        if self.push and "/" not in self.repo_id:
+            raise ValueError("hub.repo_id must use the form 'namespace/name'.")
+        if not self.config_name:
+            raise ValueError("hub.config_name cannot be empty.")
+
+
+@dataclass(frozen=True)
+class SFTGenerationTargets:
+    train: int = 500
+    validation: int = 75
+
+    def __post_init__(self) -> None:
+        if self.train <= 0 or self.validation <= 0:
+            raise ValueError("SFT train and validation targets must be positive.")
+
+    @property
+    def split_targets(self) -> dict[str, int]:
+        return {"sft_train": self.train, "sft_validation": self.validation}
+
+
+@dataclass(frozen=True)
+class GRPOGenerationTargets:
+    train: int = 500
+    validation: int = 75
+    test: int = 100
+
+    def __post_init__(self) -> None:
+        if self.train <= 0 or self.validation <= 0 or self.test <= 0:
+            raise ValueError("GRPO train, validation, and test targets must be positive.")
+
+    @property
+    def split_targets(self) -> dict[str, int]:
+        return {
+            "grpo_train": self.train,
+            "grpo_validation": self.validation,
+            "test": self.test,
+        }
+
+
+@dataclass(frozen=True)
+class GRPOGenerationInputOptions:
+    sft_canonical_path: str = "data/canonical/scientific_design_sft_tasks.jsonl"
+
+    def __post_init__(self) -> None:
+        if not self.sft_canonical_path:
+            raise ValueError("input.sft_canonical_path cannot be empty.")
+
+
+@dataclass(frozen=True)
+class SFTGenerationConfig:
+    models: GenerationModelsOptions
+    targets: SFTGenerationTargets
+    task_family_weights: dict[str, float]
+    source: SourcePoolOptions
+    generation: GenerationAPIOptions
+    output: GenerationOutputOptions
+    hub: DatasetPublicationOptions
+
+
+@dataclass(frozen=True)
+class GRPOGenerationConfig:
+    models: GenerationModelsOptions
+    targets: GRPOGenerationTargets
+    task_family_weights: dict[str, float]
+    source: SourcePoolOptions
+    generation: GenerationAPIOptions
+    input: GRPOGenerationInputOptions
+    output: GenerationOutputOptions
+    hub: DatasetPublicationOptions
+
+
 ConfigType = TypeVar("ConfigType")
 
 
@@ -253,6 +399,34 @@ def _document(path: str | Path) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise ValueError("The TOML root must be a table.")
     return document
+
+
+def _validate_task_family_weights(values: dict[str, Any]) -> dict[str, float]:
+    if set(values) != set(TASK_FAMILIES):
+        raise ValueError(
+            "The [task_family_weights] table must define exactly: "
+            + ", ".join(TASK_FAMILIES)
+        )
+    weights = {name: float(value) for name, value in values.items()}
+    if any(value < 0 for value in weights.values()) or sum(weights.values()) <= 0:
+        raise ValueError("Task-family weights must be non-negative with a positive sum.")
+    return weights
+
+
+def _validate_generation_scale(
+    *,
+    target_total: int,
+    source: SourcePoolOptions,
+    generation: GenerationAPIOptions,
+) -> None:
+    if source.candidate_limit < target_total:
+        raise ValueError(
+            "source.candidate_limit cannot be smaller than the accepted-example total."
+        )
+    if generation.max_attempts < target_total:
+        raise ValueError(
+            "generation.max_attempts cannot be smaller than the accepted-example total."
+        )
 
 
 def load_sft_config(path: str | Path) -> SFTJobConfig:
@@ -303,7 +477,106 @@ def load_grpo_config(path: str | Path) -> GRPOJobConfig:
     )
 
 
-def config_as_dict(config: SFTJobConfig | GRPOJobConfig) -> dict[str, Any]:
+def load_sft_generation_config(path: str | Path) -> SFTGenerationConfig:
+    document = _document(path)
+    targets = _construct(
+        SFTGenerationTargets,
+        _table(document, "targets"),
+        "targets",
+    )
+    source = _construct(SourcePoolOptions, _table(document, "source"), "source")
+    generation = _construct(
+        GenerationAPIOptions,
+        _table(document, "generation"),
+        "generation",
+    )
+    _validate_generation_scale(
+        target_total=sum(targets.split_targets.values()),
+        source=source,
+        generation=generation,
+    )
+    return SFTGenerationConfig(
+        models=_construct(
+            GenerationModelsOptions,
+            _table(document, "models"),
+            "models",
+        ),
+        targets=targets,
+        task_family_weights=_validate_task_family_weights(
+            _table(document, "task_family_weights")
+        ),
+        source=source,
+        generation=generation,
+        output=_construct(
+            GenerationOutputOptions,
+            _table(document, "output"),
+            "output",
+        ),
+        hub=_construct(
+            DatasetPublicationOptions,
+            _table(document, "hub"),
+            "hub",
+        ),
+    )
+
+
+def load_grpo_generation_config(path: str | Path) -> GRPOGenerationConfig:
+    document = _document(path)
+    targets = _construct(
+        GRPOGenerationTargets,
+        _table(document, "targets"),
+        "targets",
+    )
+    source = _construct(SourcePoolOptions, _table(document, "source"), "source")
+    generation = _construct(
+        GenerationAPIOptions,
+        _table(document, "generation"),
+        "generation",
+    )
+    _validate_generation_scale(
+        target_total=sum(targets.split_targets.values()),
+        source=source,
+        generation=generation,
+    )
+    return GRPOGenerationConfig(
+        models=_construct(
+            GenerationModelsOptions,
+            _table(document, "models"),
+            "models",
+        ),
+        targets=targets,
+        task_family_weights=_validate_task_family_weights(
+            _table(document, "task_family_weights")
+        ),
+        source=source,
+        generation=generation,
+        input=_construct(
+            GRPOGenerationInputOptions,
+            _table(document, "input"),
+            "input",
+        ),
+        output=_construct(
+            GenerationOutputOptions,
+            _table(document, "output"),
+            "output",
+        ),
+        hub=_construct(
+            DatasetPublicationOptions,
+            _table(document, "hub"),
+            "hub",
+        ),
+    )
+
+
+AnyJobConfig = (
+    SFTJobConfig
+    | GRPOJobConfig
+    | SFTGenerationConfig
+    | GRPOGenerationConfig
+)
+
+
+def config_as_dict(config: AnyJobConfig) -> dict[str, Any]:
     return dataclasses.asdict(config)
 
 
@@ -330,6 +603,14 @@ def with_cli_overrides(
         hub = replace(hub, push=False)
         training = replace(training, max_steps=1)
     return replace(config, output=output, hub=hub, training=training)
+
+
+def with_generation_push_override(
+    config: SFTGenerationConfig | GRPOGenerationConfig,
+    *,
+    push: bool | None,
+) -> SFTGenerationConfig | GRPOGenerationConfig:
+    return config if push is None else replace(config, hub=replace(config.hub, push=push))
 
 
 def latest_checkpoint(output_directory: str | Path) -> Path | None:
