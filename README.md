@@ -219,7 +219,7 @@ scientific-sft-grpo generate-sft \
   --no-push
 ```
 
-### Large `L` datasets: 10,000 SFT and 1,000 GRPO
+### Large `L` datasets: 10,000 SFT and 1,200 GRPO
 
 Two isolated large-run configurations are committed. They do not overwrite the teaching
 datasets:
@@ -227,7 +227,7 @@ datasets:
 | Configuration | Splits | Accepted total | Hub configuration |
 |---|---|---:|---|
 | `generate_sft_L.toml` | 9,000 train + 1,000 validation | 10,000 | `scientific_design_sft_L` |
-| `generate_grpo_L.toml` | 800 train + 100 validation + 100 test | 1,000 | `scientific_design_grpo_L` |
+| `generate_grpo_L.toml` | 1,000 train + 100 validation + 100 test | 1,200 | `scientific_design_grpo_L` |
 
 Run them in order:
 

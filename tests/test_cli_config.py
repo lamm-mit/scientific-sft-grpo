@@ -81,8 +81,8 @@ def test_large_generation_configs_have_exact_requested_totals_and_isolated_paths
     assert sum(sft.targets.split_targets.values()) == 10_000
     assert sft.targets.train == 9000
     assert sft.targets.validation == 1000
-    assert sum(grpo.targets.split_targets.values()) == 1000
-    assert grpo.targets.train == 800
+    assert sum(grpo.targets.split_targets.values()) == 1200
+    assert grpo.targets.train == 1000
     assert grpo.targets.validation == grpo.targets.test == 100
     assert sft.output.name == "scientific_design_sft_L"
     assert grpo.output.name == "scientific_design_grpo_L"

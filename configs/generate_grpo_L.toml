@@ -3,7 +3,7 @@ teacher_model = "gpt-5.6-terra"
 critic_model = "gpt-5.6-terra"
 
 [targets]
-train = 800
+train = 1000
 validation = 100
 test = 100
 
